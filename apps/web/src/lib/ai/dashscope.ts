@@ -8,6 +8,7 @@ export type ChatMessage = {
 const DEFAULT_EMBEDDING_MODEL = "text-embedding-v4";
 const DEFAULT_EMBEDDING_DIMENSION = 1536;
 const DEFAULT_CHAT_MODEL = "qwen-plus";
+const DEFAULT_DASHSCOPE_TIMEOUT_MS = 30000;
 const DEFAULT_DASHSCOPE_EMBEDDINGS_URL =
   "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding";
 const DEFAULT_DASHSCOPE_CHAT_COMPLETIONS_URL =
@@ -45,6 +46,16 @@ function getDashScopeChatCompletionsUrl() {
   return process.env.DASHSCOPE_CHAT_COMPLETIONS_URL || DEFAULT_DASHSCOPE_CHAT_COMPLETIONS_URL;
 }
 
+function getDashScopeTimeoutMs() {
+  const timeoutMs = Number(process.env.DASHSCOPE_TIMEOUT_MS || DEFAULT_DASHSCOPE_TIMEOUT_MS);
+
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_DASHSCOPE_TIMEOUT_MS;
+}
+
+function createTimeoutSignal() {
+  return AbortSignal.timeout(getDashScopeTimeoutMs());
+}
+
 async function parseDashScopeResponse(response: Response) {
   const payload = await response.json().catch(() => null);
 
@@ -75,6 +86,7 @@ export async function createQueryEmbedding(question: string) {
         output_type: "dense",
       },
     }),
+    signal: createTimeoutSignal(),
   });
 
   const payload = await parseDashScopeResponse(response);
@@ -99,6 +111,7 @@ export async function generateChatAnswer(messages: ChatMessage[]) {
       messages,
       temperature: 0.2,
     }),
+    signal: createTimeoutSignal(),
   });
 
   const payload = await parseDashScopeResponse(response);
