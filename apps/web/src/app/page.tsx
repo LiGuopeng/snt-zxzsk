@@ -2,6 +2,9 @@
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
+import { ChatWorkspace, type ChatMessage } from "./components/chat-workspace";
+import { DesignWorkspace } from "./components/design-workspace";
+
 type Source = {
   source_file: string;
   section: string | null;
@@ -16,13 +19,6 @@ type ChatResponse = {
   answer?: string;
   sources?: Source[];
   error?: string;
-};
-
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  sources?: Source[];
 };
 
 type Conversation = {
@@ -63,7 +59,6 @@ function createMessageId() {
 }
 
 function formatConversationTime(updatedAt: string) {
-  // 左侧列表只需要一个轻量时间提示，具体时间仍以数据库 updated_at 为准。
   const updatedTime = new Date(updatedAt).getTime();
 
   if (Number.isNaN(updatedTime)) {
@@ -95,6 +90,7 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [activeWorkspace, setActiveWorkspace] = useState<"chat" | "design">("design");
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
@@ -109,7 +105,6 @@ export default function Home() {
     () => input.trim().length > 0 && !activeConversationLoading,
     [activeConversationLoading, input],
   );
-  const hasMessages = messages.length > 0;
   const confirmingConversation = useMemo(
     () =>
       conversations.find((conversation) => conversation.id === confirmingDeleteId) || null,
@@ -130,8 +125,6 @@ export default function Home() {
   }
 
   async function loadMessages(sessionId: string) {
-    // 点击左侧某个会话时，再读取该会话下的 messages。
-    // 不在列表接口里一次性读取所有消息，避免会话多了以后首页变慢。
     const response = await fetch(`/api/chat/sessions/${sessionId}/messages`);
     const payload = (await response.json()) as MessagesResponse;
 
@@ -311,23 +304,20 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-[#f4f8ff] text-[#091b3d]">
+    <main className="min-h-screen bg-[#f4f7fb] text-[#091b3d]">
       <div className="flex h-screen overflow-hidden">
-        <aside className="hidden w-[300px] shrink-0 flex-col bg-[#061a3d] text-white md:flex">
-          <div className="flex h-20 items-center justify-between px-5">
+        <aside className="hidden w-[250px] shrink-0 flex-col bg-[#061a3d] text-white md:flex">
+          <div className="flex h-20 items-center px-5">
             <div className="text-2xl font-semibold tracking-normal">genengi</div>
-            <button
-              className="grid size-9 place-items-center rounded-full bg-white/10 text-lg text-white/80 transition hover:bg-white/15"
-              type="button"
-            >
-              «
-            </button>
           </div>
 
-          <div className="px-5">
+          <div className="px-4">
             <button
-              className="flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-[#0969ff] px-4 text-sm font-medium text-white shadow-[0_12px_30px_rgba(9,105,255,0.35)] transition hover:bg-[#005bed]"
-              onClick={() => void startNewChat()}
+              className="flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[#0969ff] px-4 text-sm font-medium text-white shadow-[0_12px_30px_rgba(9,105,255,0.35)] transition hover:bg-[#005bed]"
+              onClick={() => {
+                setActiveWorkspace("chat");
+                void startNewChat();
+              }}
               type="button"
             >
               <span className="text-xl leading-none">+</span>
@@ -335,8 +325,34 @@ export default function Home() {
             </button>
           </div>
 
-          <div className="mt-8 flex-1 overflow-y-auto px-4">
-            <div className="mb-3 px-1 text-sm font-semibold text-white/75">对话</div>
+          <nav className="mt-7 space-y-1 px-3">
+            {[
+              ["chat", "AI装修顾问"],
+              ["design", "效果图生成"],
+            ].map(([key, label]) => (
+              <button
+                className={
+                  activeWorkspace === key
+                    ? "flex h-11 w-full items-center gap-3 rounded-lg bg-white/14 px-3 text-sm font-medium text-white"
+                    : "flex h-11 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium text-white/78 transition hover:bg-white/10 hover:text-white"
+                }
+                key={key}
+                onClick={() => setActiveWorkspace(key as "chat" | "design")}
+                type="button"
+              >
+                <span className="grid size-6 place-items-center rounded-md border border-white/22 text-xs">
+                  {key === "design" ? "图" : "问"}
+                </span>
+                {label}
+              </button>
+            ))}
+          </nav>
+
+          <div className="mt-6 flex-1 overflow-y-auto px-4">
+            <div className="mb-3 flex items-center justify-between px-1">
+              <div className="text-sm font-semibold text-white/75">聊天记录</div>
+              <span className="text-xs text-white/40">{conversations.length}</span>
+            </div>
 
             <div className="space-y-2">
               {conversations.length === 0 ? (
@@ -346,7 +362,7 @@ export default function Home() {
               {conversations.map((conversation) => (
                 <div
                   className={
-                    conversation.id === activeConversationId
+                    conversation.id === activeConversationId && activeWorkspace === "chat"
                       ? "group flex h-11 w-full items-center gap-1 rounded-lg bg-white/14 px-1.5 text-sm text-white"
                       : "group flex h-11 w-full items-center gap-1 rounded-lg px-1.5 text-sm text-white/78 transition hover:bg-white/10 hover:text-white"
                   }
@@ -355,6 +371,7 @@ export default function Home() {
                   <button
                     className="flex min-w-0 flex-1 items-center justify-between gap-3 px-1.5 text-left"
                     onClick={() => {
+                      setActiveWorkspace("chat");
                       setActiveConversationId(conversation.id);
                       setConfirmingDeleteId(null);
                       setError("");
@@ -382,12 +399,7 @@ export default function Home() {
                     onClick={() => setConfirmingDeleteId(conversation.id)}
                     type="button"
                   >
-                    <svg
-                      aria-hidden="true"
-                      className="size-4"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                    >
+                    <svg aria-hidden="true" className="size-4" fill="none" viewBox="0 0 24 24">
                       <path
                         d="M9 4h6m-8 4h10m-9 0 .7 11h6.6L16 8"
                         stroke="currentColor"
@@ -402,262 +414,57 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="border-t border-white/10 p-4">
+          <div className="space-y-3 border-t border-white/10 p-4">
+            <div className="rounded-lg border border-white/10 bg-white/5 p-3">
+              <div className="text-xs text-white/55">当前项目</div>
+              <div className="mt-2 text-sm font-semibold">我的新家</div>
+              <div className="mt-1 text-xs text-white/55">三居室 · 98平 · 奶油风</div>
+            </div>
             <button
-              className="flex h-11 w-full items-center gap-3 rounded-lg px-2 text-sm text-white/82 transition hover:bg-white/10"
+              className="flex h-10 w-full items-center justify-center rounded-lg border border-white/12 text-sm text-white/78 transition hover:bg-white/10"
               type="button"
             >
-              <span className="grid size-8 place-items-center rounded-full bg-white/12 text-white">
-                设
-              </span>
-              <span className="truncate">设置</span>
+              管理知识库
             </button>
           </div>
         </aside>
 
-        <section className="flex min-w-0 flex-1 flex-col bg-[radial-gradient(circle_at_80%_12%,rgba(62,133,255,0.18),transparent_30%),linear-gradient(180deg,#ffffff_0%,#f5f8ff_48%,#eef5ff_100%)]">
-          <header className="flex h-14 shrink-0 items-center justify-between px-4 md:px-8">
-            <div className="flex items-center gap-3">
-              <button
-                className="grid size-9 place-items-center rounded-lg border border-[#c9dcff] text-lg text-[#0969ff] md:hidden"
-                onClick={() => void startNewChat()}
-                type="button"
-              >
-                +
-              </button>
-              <div>
-                <div className="text-sm font-semibold text-[#091b3d]">AI 装修顾问</div>
-                <div className="text-xs text-[#647399]">基于 3535 个知识片段回答</div>
+        <section className="flex min-w-0 flex-1 flex-col bg-[#f4f7fb]">
+          <header className="flex h-[72px] shrink-0 items-center justify-between border-b border-[#dbe5f3] bg-white px-4 md:px-7">
+            <div>
+              <h1 className="text-2xl font-semibold tracking-normal text-[#111827]">
+                {activeWorkspace === "design" ? "效果图生成" : "AI装修顾问"}
+              </h1>
+              <div className="mt-1 text-sm text-[#6b7894]">
+                {activeWorkspace === "design"
+                  ? "上传户型图，生成统一风格的全屋效果图方案"
+                  : "基于装修知识库回答施工、材料、预算、验收问题"}
               </div>
             </div>
-            <div className="rounded-full border border-[#c9dcff] bg-white/70 px-3 py-1 text-xs text-[#42557d] shadow-sm">
-              qwen-plus
+            <div className="flex items-center gap-3">
+              <button className="grid size-9 place-items-center rounded-full border border-[#d8e4f5] text-[#42557d]" type="button">
+                ?
+              </button>
+              <div className="grid size-9 place-items-center rounded-full bg-[#4b55d9] text-sm font-semibold text-white">
+                W
+              </div>
             </div>
           </header>
 
-          <div className="flex-1 overflow-y-auto">
-            {!hasMessages ? (
-              <section className="mx-auto flex min-h-full w-full max-w-6xl flex-col justify-center px-6 py-10">
-                <div className="grid items-center gap-10 lg:grid-cols-[1fr_360px]">
-                  <div>
-                    <div className="inline-flex w-fit items-center gap-2 rounded-full border border-[#c9dcff] bg-white/80 px-4 py-2 text-sm font-medium text-[#0969ff] shadow-sm">
-                      <span>✦</span>
-                      AI 装修顾问
-                    </div>
-
-                    <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-normal text-[#071a44] md:text-5xl">
-                      今天想解决哪个装修问题？
-                    </h1>
-                    <p className="mt-5 max-w-3xl text-[15px] leading-8 text-[#405176]">
-                      直接描述房子、阶段、报价、合同或现场现象。我会先检索你的装修知识库，再给出简洁建议和参考来源。
-                    </p>
-
-                    <div className="mt-8 grid w-full gap-3 sm:grid-cols-2">
-                      {EXAMPLE_QUESTIONS.map((question, index) => (
-                        <button
-                          className="group flex min-h-20 items-center gap-4 rounded-xl border border-[#d8e6ff] bg-white/82 p-4 text-left shadow-[0_14px_36px_rgba(38,96,190,0.07)] transition hover:-translate-y-0.5 hover:border-[#8ebcff] hover:bg-white hover:shadow-[0_18px_42px_rgba(38,96,190,0.12)]"
-                          key={question}
-                          onClick={() => submitQuestion(undefined, question)}
-                          type="button"
-                        >
-                          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#eaf3ff] text-sm font-semibold text-[#0969ff] group-hover:bg-[#0969ff] group-hover:text-white">
-                            {index + 1}
-                          </span>
-                          <span className="min-w-0 text-sm leading-6 text-[#20345d]">
-                            {question}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="hidden lg:block">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#d8e6ff] bg-white/70 p-5 shadow-[0_24px_70px_rgba(38,96,190,0.12)]">
-                      <div className="absolute inset-0 bg-[linear-gradient(#dbe9ff_1px,transparent_1px),linear-gradient(90deg,#dbe9ff_1px,transparent_1px)] bg-[size:22px_22px] opacity-45" />
-                      <div className="relative">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <div className="text-sm font-semibold text-[#071a44]">装修问题整理</div>
-                            <div className="mt-1 text-xs text-[#647399]">预算 / 合同 / 施工 / 验收</div>
-                          </div>
-                          <div className="grid size-11 place-items-center rounded-xl bg-[#0969ff] text-lg font-semibold text-white shadow-[0_12px_30px_rgba(9,105,255,0.28)]">
-                            G
-                          </div>
-                        </div>
-
-                        <div className="mt-8 rounded-xl border border-[#c9dcff] bg-white/80 p-4">
-                          <div className="mb-4 h-2 w-24 rounded-full bg-[#0969ff]" />
-                          <div className="grid grid-cols-2 gap-3">
-                            <div className="h-20 rounded-lg border border-[#c9dcff] bg-[#f6faff]" />
-                            <div className="h-20 rounded-lg border border-[#c9dcff] bg-[#f6faff]" />
-                            <div className="h-14 rounded-lg border border-[#c9dcff] bg-white" />
-                            <div className="h-14 rounded-lg border border-[#c9dcff] bg-white" />
-                          </div>
-                        </div>
-
-                        <div className="mt-4 grid grid-cols-3 gap-3 text-center text-xs text-[#42557d]">
-                          <div className="rounded-lg bg-white/86 px-2 py-3 shadow-sm">找依据</div>
-                          <div className="rounded-lg bg-white/86 px-2 py-3 shadow-sm">判风险</div>
-                          <div className="rounded-lg bg-white/86 px-2 py-3 shadow-sm">给建议</div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </section>
-            ) : (
-              <section className="mx-auto w-full max-w-3xl px-4 py-6">
-                {messages.map((message) => (
-                  <article className="group py-5" key={message.id}>
-                    {message.role === "user" ? (
-                      <div className="flex justify-end">
-                        <div className="flex max-w-[78%] flex-row-reverse items-start gap-3">
-                          <div className="grid size-8 shrink-0 place-items-center rounded-full bg-[#2563eb] text-sm font-semibold text-white">
-                            你
-                          </div>
-                          <div className="min-w-0">
-                            <div className="mb-1 text-right text-sm font-semibold text-[#091b3d]">
-                              你
-                            </div>
-                            <div className="rounded-2xl rounded-tr-md bg-[#0969ff] px-4 py-3 text-left text-[15px] leading-7 text-white shadow-[0_10px_24px_rgba(9,105,255,0.24)]">
-                              {message.content}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="flex gap-4">
-                        <div className="grid size-8 shrink-0 place-items-center rounded-full bg-[#061a3d] text-sm font-semibold text-white">
-                          G
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="mb-1 text-sm font-semibold text-[#091b3d]">genengi</div>
-                          <div className="whitespace-pre-wrap text-[15px] leading-8 text-[#233657]">
-                            {message.content}
-                          </div>
-
-                          {message.sources?.length ? (
-                            <details className="mt-4 rounded-xl border border-[#d8e6ff] bg-white/80 p-3">
-                              <summary className="cursor-pointer text-sm font-medium text-[#20345d]">
-                                参考来源 {message.sources.length} 条
-                              </summary>
-                              <div className="mt-3 grid gap-2">
-                                {message.sources.map((source, index) => (
-                                  <div
-                                    className="rounded-lg bg-[#f6f9ff] p-3 text-xs leading-5 text-[#42557d]"
-                                    key={`${source.source_file}-${source.section}-${index}`}
-                                  >
-                                    <div className="mb-1 flex flex-wrap gap-2">
-                                      <span className="rounded bg-[#e9f2ff] px-2 py-0.5 text-[#0969ff]">
-                                        {source.layer || "未标注"}
-                                      </span>
-                                      <span>{source.module || "未标注"}</span>
-                                      <span>{source.similarity.toFixed(4)}</span>
-                                    </div>
-                                    <div className="break-all font-medium">
-                                      {source.source_file}
-                                    </div>
-                                    <div className="mt-1 text-[#647399]">
-                                      {source.section || "未标注章节"}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </details>
-                          ) : null}
-                        </div>
-                      </div>
-                    )}
-                  </article>
-                ))}
-
-                {activeConversationLoading ? (
-                  <article className="py-5">
-                    <div className="flex gap-4">
-                      <div className="grid size-8 shrink-0 place-items-center rounded-full bg-[#061a3d] text-sm font-semibold text-white">
-                        G
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="mb-1 text-sm font-semibold text-[#091b3d]">genengi</div>
-                        <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-2 text-sm text-[#647399] shadow-sm">
-                          <span className="size-2 animate-pulse rounded-full bg-[#0969ff]" />
-                          正在检索知识库并生成回答...
-                        </div>
-                      </div>
-                    </div>
-                  </article>
-                ) : null}
-              </section>
-            )}
-          </div>
-
-          <div className="shrink-0 px-5 pb-5">
-            <div className="mx-auto w-full max-w-5xl">
-              {error ? (
-                <div className="mb-3 rounded-xl border border-[#fecaca] bg-[#fef2f2] px-4 py-3 text-sm text-[#991b1b]">
-                  {error}
-                </div>
-              ) : null}
-
-              <form
-                className="rounded-2xl border border-[#9fc5ff] bg-white/90 p-3 shadow-[0_18px_60px_rgba(9,105,255,0.14)] backdrop-blur"
-                onSubmit={submitQuestion}
-              >
-                <div className="flex gap-3">
-                  <textarea
-                    aria-label="输入装修问题"
-                    className="max-h-36 min-h-20 flex-1 resize-none bg-transparent px-2 py-2 text-[15px] leading-7 text-[#091b3d] outline-none placeholder:text-[#7d8db3]"
-                    onChange={(event) => setInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.shiftKey) {
-                        event.preventDefault();
-                        if (canSubmit) {
-                          void submitQuestion();
-                        }
-                      }
-                    }}
-                    placeholder="询问装修预算、合同、施工、验收、售后问题..."
-                    value={input}
-                  />
-                  <button
-                    aria-label="发送问题"
-                    className={
-                      activeConversationLoading
-                        ? "mt-auto grid size-12 shrink-0 cursor-not-allowed place-items-center rounded-full bg-[#e8f0ff] text-[#7f96c4] shadow-none transition"
-                        : canSubmit
-                          ? "mt-auto grid size-12 shrink-0 place-items-center rounded-full bg-[#0969ff] text-white shadow-[0_12px_30px_rgba(9,105,255,0.32)] transition hover:bg-[#005bed]"
-                          : "mt-auto grid size-12 shrink-0 cursor-not-allowed place-items-center rounded-full bg-[#eef4ff] text-[#9fb2d6] shadow-none transition"
-                    }
-                    disabled={!canSubmit}
-                    type="submit"
-                  >
-                    {activeConversationLoading ? (
-                      <span className="size-2.5 animate-pulse rounded-full bg-current" />
-                    ) : (
-                      <svg
-                        aria-hidden="true"
-                        className="size-5"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                      >
-                        <path
-                          d="M12 19V5m0 0-6 6m6-6 6 6"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="2.4"
-                        />
-                      </svg>
-                    )}
-                  </button>
-                </div>
-
-              </form>
-              <p className="mt-2 text-center text-xs text-[#7d8db3]">
-                回答由知识库检索增强生成，关键装修决策建议结合合同和现场情况复核。
-              </p>
-            </div>
-          </div>
+          {activeWorkspace === "design" ? (
+            <DesignWorkspace />
+          ) : (
+            <ChatWorkspace
+              activeConversationLoading={activeConversationLoading}
+              canSubmit={canSubmit}
+              error={error}
+              exampleQuestions={EXAMPLE_QUESTIONS}
+              input={input}
+              messages={messages}
+              onInputChange={setInput}
+              onSubmit={submitQuestion}
+            />
+          )}
         </section>
       </div>
 
