@@ -6,6 +6,7 @@
 
 如果线上日志出现下面提示，说明该表还没有建好，但不会影响正常聊天：
 
+
 ```text
 [chat_request_logs] skipped: Could not find the table 'public.chat_request_logs' in the schema cache
 ```
