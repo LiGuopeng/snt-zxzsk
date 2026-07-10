@@ -182,7 +182,7 @@ export async function POST(request: Request) {
     intentProfileForLog = intentProfile;
     const queryEmbedding = await createQueryEmbedding(retrievalQuestion);
 
-    // 2. 用 query embedding 去 Supabase pgvector 检索相关知识片段。
+    // 2. 用 query embedding 去 PostgreSQL pgvector 检索相关知识片段。
     // 正式上线第一版：普通向量召回 + 意图强制召回 + embedding 缺失时关键词兜底。
     const retrievalResult = await retrieveKnowledgeForQuestion(queryEmbedding, intentProfile);
     retrievalStatsForLog = retrievalResult.stats;

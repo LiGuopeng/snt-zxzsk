@@ -1,5 +1,5 @@
--- Supabase schema for the decoration Q&A Agent.
--- Run this file in Supabase SQL Editor after creating a project.
+-- PostgreSQL schema for the decoration Q&A Agent.
+-- Run this file on the application PostgreSQL database.
 
 create extension if not exists vector;
 

@@ -112,7 +112,7 @@ export default function Home() {
   );
 
   async function loadSessions() {
-    // 左侧栏会话列表从 Supabase chat_sessions 读取。
+    // 左侧栏会话列表从 PostgreSQL chat_sessions 读取。
     // 这一步替代之前的 localStorage 本地假记忆。
     const response = await fetch("/api/chat/sessions");
     const payload = (await response.json()) as SessionsResponse;
@@ -181,7 +181,7 @@ export default function Home() {
     // 这里直接使用 activeConversationId，避免左侧会话列表尚未刷新时 activeConversation 查不到，
     // 导致后端误以为是新会话，从而丢失上一轮上下文。
     // 先把用户消息放到页面里，减少等待感。
-    // 真正的持久化由 /api/chat 写入 Supabase。
+    // 真正的持久化由 /api/chat 写入 PostgreSQL。
     setMessages((current) => [...current, userMessage]);
 
     setInput("");

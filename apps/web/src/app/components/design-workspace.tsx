@@ -338,6 +338,7 @@ export function DesignWorkspace() {
       }
 
       setFloorPlan(payload.floorPlan);
+      // 上传成功后立即启动真实户型解析，解析结果会回填户型、面积、空间列表和动线。
       void analyzeFloorPlan(payload.floorPlan.id);
       setRenders([]);
       setGenerationJob(null);
@@ -382,6 +383,7 @@ export function DesignWorkspace() {
   }
 
   async function pollGenerationJob(jobId: string) {
+    // 兼容后续改成异步队列的场景；当前接口通常会在请求内完成并直接返回 completed。
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await wait(3000);
 
@@ -434,6 +436,7 @@ export function DesignWorkspace() {
     });
 
     try {
+      // 首次生成只请求全屋主图，空间图改为用户点击空间后再按需生成。
       const response = await fetch("/api/design/jobs", {
         method: "POST",
         headers: {
@@ -489,6 +492,7 @@ export function DesignWorkspace() {
     setGenerationError("");
 
     try {
+      // 空间名称来自户型解析结果，避免用固定默认空间生成与实际户型不匹配的图片。
       const response = await fetch(`/api/design/jobs/${generationJob.id}/spaces`, {
         method: "POST",
         headers: {

@@ -92,7 +92,7 @@ export async function matchKnowledgeChunks(
     layerFilter?: string | null;
   },
 ) {
-  // 这里调用 infra/supabase/schema.sql 里已经创建好的数据库函数：
+  // 这里调用 PostgreSQL 里已经创建好的数据库函数：
   // public.match_knowledge_chunks(query_embedding, match_count, layer_filter)
   //
   // 它会在 pgvector 中按 cosine similarity 找最相关的知识片段。

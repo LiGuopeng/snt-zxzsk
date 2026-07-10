@@ -2,12 +2,20 @@ import { NextResponse } from "next/server";
 
 import { createPostgresClient } from "@/lib/db/postgres";
 
-async function getTableCount(tableName: string) {
+type KnowledgeTable = "knowledge_documents" | "knowledge_chunks";
+
+async function getTableCount(tableName: KnowledgeTable) {
   const sql = createPostgresClient();
-  const [row] = await sql<{ count: string }[]>`
-    select count(*)::text as count
-    from ${sql("public", tableName)}
-  `;
+  const [row] =
+    tableName === "knowledge_documents"
+      ? await sql<{ count: string }[]>`
+          select count(*)::text as count
+          from public.knowledge_documents
+        `
+      : await sql<{ count: string }[]>`
+          select count(*)::text as count
+          from public.knowledge_chunks
+        `;
 
   return Number(row?.count || 0);
 }

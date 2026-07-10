@@ -1,5 +1,5 @@
--- Supabase schema patch for the whole-home design render module.
--- Run this file in Supabase SQL Editor after infra/supabase/schema.sql.
+-- PostgreSQL schema patch for the whole-home design render module.
+-- Run this file after infra/postgres/schema.sql.
 
 create table if not exists public.design_projects (
   id uuid primary key default gen_random_uuid(),
@@ -66,7 +66,7 @@ comment on table public.design_floor_plans is
   '户型图表：保存上传文件信息和户型解析结果，是生成全屋效果图的必传输入。';
 comment on column public.design_floor_plans.project_id is '所属效果图项目 ID。';
 comment on column public.design_floor_plans.file_url is '户型图可访问地址。';
-comment on column public.design_floor_plans.storage_path is '户型图在 Supabase Storage 中的对象路径。';
+comment on column public.design_floor_plans.storage_path is '户型图在应用文件存储中的对象路径。';
 comment on column public.design_floor_plans.file_name is '用户上传时的原始文件名。';
 comment on column public.design_floor_plans.file_type is '文件 MIME 类型，例如 image/png、image/jpeg、application/pdf。';
 comment on column public.design_floor_plans.file_size is '文件大小，单位 byte。';

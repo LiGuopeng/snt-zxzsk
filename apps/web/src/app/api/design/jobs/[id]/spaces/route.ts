@@ -3,9 +3,8 @@ import { randomUUID } from "crypto";
 import { NextResponse } from "next/server";
 
 import { generateInteriorDesignImage } from "@/lib/ai/dashscope-images";
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
-
-const DESIGN_ASSETS_BUCKET = "design-assets";
+import { createPostgresClient } from "@/lib/db/postgres";
+import { saveDesignAsset } from "@/lib/storage/design-assets";
 
 type RouteContext = {
   params: Promise<{
@@ -23,6 +22,7 @@ function getStringValue(value: unknown) {
 }
 
 function normalizeSpaceType(spaceName: string, spaceType: string | null) {
+  // 空间图的标题由解析出的空间名称决定，不再使用固定默认空间列表。
   const value = `${spaceType || ""} ${spaceName}`.toLowerCase();
 
   if (value.includes("living") || spaceName.includes("客厅")) return "客厅效果图";
@@ -65,6 +65,7 @@ function buildPrompt(params: {
   viewName: string;
 }) {
   return [
+    // 空间图只生成当前房间的 2D 室内效果，不和全屋 3D 总览混在同一个 prompt 里。
     `生成一张真实可用的${params.spaceName} 2D 室内装修效果图。`,
     "画面要求：普通室内效果图视角，摄影级渲染，真实材质，自然光线，合理广角，现代家装产品图质感。",
     "空间效果图只表现当前房间或功能区，不使用全屋 3D 轴测视角。",
@@ -84,28 +85,13 @@ async function uploadGeneratedImage(params: {
   jobId: string;
   projectId: string;
 }) {
-  const supabase = createSupabaseAdminClient();
-  const storagePath = `renders/${params.projectId}/${params.jobId}-${randomUUID()}.png`;
-
-  const { error: uploadError } = await supabase.storage
-    .from(DESIGN_ASSETS_BUCKET)
-    .upload(storagePath, params.imageBuffer, {
-      contentType: "image/png",
-      upsert: false,
-    });
-
-  if (uploadError) {
-    throw new Error(`保存生成图片失败：${uploadError.message}`);
-  }
-
-  const {
-    data: { publicUrl },
-  } = supabase.storage.from(DESIGN_ASSETS_BUCKET).getPublicUrl(storagePath);
-
-  return {
-    publicUrl,
-    storagePath,
-  };
+  return saveDesignAsset({
+    buffer: params.imageBuffer,
+    contentType: "image/png",
+    extension: `-${params.jobId}-${randomUUID()}.png`,
+    prefix: "renders",
+    projectId: params.projectId,
+  });
 }
 
 export async function POST(request: Request, context: RouteContext) {
@@ -125,60 +111,65 @@ export async function POST(request: Request, context: RouteContext) {
       );
     }
 
-    const supabase = createSupabaseAdminClient();
-    const { data: job, error: jobError } = await supabase
-      .from("design_generation_jobs")
-      .select("id,project_id,floor_plan_id,status")
-      .eq("id", id)
-      .single();
+    const sql = createPostgresClient();
+    const [job] = await sql`
+      select id,project_id,floor_plan_id,status
+      from public.design_generation_jobs
+      where id = ${id}
+      limit 1
+    `;
 
-    if (jobError || !job) {
+    if (!job) {
       return NextResponse.json(
         {
           ok: false,
-          error: jobError?.message || "生成任务不存在",
+          error: "生成任务不存在",
         },
         { status: 404 },
       );
     }
 
-    const { data: existingRender } = await supabase
-      .from("design_renders")
-      .select("id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at")
-      .eq("job_id", id)
-      .eq("space_name", spaceName)
-      .maybeSingle();
+    const [existingRender] = await sql`
+      select id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at
+      from public.design_renders
+      where job_id = ${id} and space_name = ${spaceName}
+      limit 1
+    `;
 
     if (existingRender) {
+      // 同一任务同一空间只生成一次；重复点击直接返回已有图片，减少生图费用和等待时间。
       return NextResponse.json({
         ok: true,
         render: existingRender,
       });
     }
 
-    const { data: project } = await supabase
-      .from("design_projects")
-      .select("intent_text")
-      .eq("id", job.project_id)
-      .single();
+    const [project] = await sql`
+      select intent_text
+      from public.design_projects
+      where id = ${job.project_id}
+      limit 1
+    `;
 
-    const { data: floorPlan, error: floorPlanError } = await supabase
-      .from("design_floor_plans")
-      .select("house_type,area,spaces,circulation")
-      .eq("id", job.floor_plan_id)
-      .single();
+    const [floorPlan] = await sql`
+      select house_type,area,spaces,circulation
+      from public.design_floor_plans
+      where id = ${job.floor_plan_id}
+      limit 1
+    `;
 
-    if (floorPlanError || !floorPlan) {
+    if (!floorPlan) {
       return NextResponse.json(
         {
           ok: false,
-          error: floorPlanError?.message || "户型解析结果不存在",
+          error: "户型解析结果不存在",
         },
         { status: 404 },
       );
     }
 
     const viewName = normalizeSpaceType(spaceName, spaceType);
+    // 空间图仍引用户型解析结果，保证单空间效果与全屋方案的面积、动线和风格一致。
     const prompt = buildPrompt({
       area: floorPlan.area,
       circulation: floorPlan.circulation,
@@ -190,43 +181,49 @@ export async function POST(request: Request, context: RouteContext) {
       viewName,
     });
     const generatedImage = await generateInteriorDesignImage(prompt);
+    // DashScope 返回的是临时图片 URL，下载后保存到本项目本地存储，前端只加载自己的 /uploads 路径。
     const uploadedImage = await uploadGeneratedImage({
       imageBuffer: generatedImage.imageBuffer,
       jobId: id,
       projectId: job.project_id,
     });
 
-    const { data: maxRender } = await supabase
-      .from("design_renders")
-      .select("sort_order")
-      .eq("job_id", id)
-      .order("sort_order", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const [maxRender] = await sql`
+      select sort_order
+      from public.design_renders
+      where job_id = ${id}
+      order by sort_order desc
+      limit 1
+    `;
 
-    const { data: render, error: renderError } = await supabase
-      .from("design_renders")
-      .insert({
-        project_id: job.project_id,
-        job_id: id,
-        space_name: spaceName,
-        view_name: viewName,
-        image_url: uploadedImage.publicUrl,
-        thumbnail_url: uploadedImage.publicUrl,
-        sort_order: typeof maxRender?.sort_order === "number" ? maxRender.sort_order + 1 : 1,
-        metadata: {
+    const [render] = await sql`
+      insert into public.design_renders (
+        project_id,
+        job_id,
+        space_name,
+        view_name,
+        image_url,
+        thumbnail_url,
+        sort_order,
+        metadata
+      )
+      values (
+        ${job.project_id},
+        ${id},
+        ${spaceName},
+        ${viewName},
+        ${uploadedImage.publicUrl},
+        ${uploadedImage.publicUrl},
+        ${typeof maxRender?.sort_order === "number" ? maxRender.sort_order + 1 : 1},
+        ${sql.json({
           source: "dashscope_image_generation",
           task_id: generatedImage.taskId,
           storage_path: uploadedImage.storagePath,
           space_type: spaceType,
-        },
-      })
-      .select("id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at")
-      .single();
-
-    if (renderError || !render) {
-      throw new Error(renderError?.message || "保存空间效果图失败");
-    }
+        })}
+      )
+      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at
+    `;
 
     return NextResponse.json({
       ok: true,

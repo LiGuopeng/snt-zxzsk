@@ -215,6 +215,20 @@ function extractJsonObject(content: string) {
   return JSON.parse(jsonText.slice(start, end + 1)) as unknown;
 }
 
+function normalizeNullableText(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const text = value.trim();
+
+  if (!text || text.includes("无法确认则为 null")) {
+    return null;
+  }
+
+  return text;
+}
+
 function normalizeFloorPlanAnalysis(payload: unknown): FloorPlanAnalysis {
   if (!payload || typeof payload !== "object") {
     throw new Error("Floor plan analysis payload is not an object");
@@ -325,24 +339,15 @@ function normalizeFloorPlanAnalysis(payload: unknown): FloorPlanAnalysis {
     house_type: typeof record.house_type === "string" && record.house_type.trim() ? record.house_type : null,
     area: typeof record.area === "number" && Number.isFinite(record.area) ? record.area : null,
     spaces,
-    circulation:
-      typeof record.circulation === "string" && record.circulation.trim()
-        ? record.circulation
-        : null,
-    orientation:
-      typeof record.orientation === "string" && record.orientation.trim()
-        ? record.orientation
-        : null,
+    circulation: normalizeNullableText(record.circulation),
+    orientation: normalizeNullableText(record.orientation),
     doors,
     windows,
     walls,
     wet_areas: wetAreas,
     balconies,
     circulation_analysis: {
-      summary:
-        typeof circulationAnalysis.summary === "string" && circulationAnalysis.summary.trim()
-          ? circulationAnalysis.summary
-          : null,
+      summary: normalizeNullableText(circulationAnalysis.summary),
       issues: Array.isArray(circulationAnalysis.issues)
         ? circulationAnalysis.issues.filter((issue): issue is string => typeof issue === "string")
         : [],

@@ -3,9 +3,8 @@ import { randomUUID } from "crypto";
 import { NextResponse } from "next/server";
 
 import { generateInteriorDesignImage } from "@/lib/ai/dashscope-images";
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
-
-const DESIGN_ASSETS_BUCKET = "design-assets";
+import { createPostgresClient } from "@/lib/db/postgres";
+import { saveDesignAsset } from "@/lib/storage/design-assets";
 
 type CreateDesignJobBody = {
   projectId?: unknown;
@@ -23,6 +22,29 @@ type RenderTarget = {
   viewName: string;
   promptFocus: string;
   sortOrder: number;
+};
+
+type FloorPlanForRender = {
+  id: string;
+  project_id: string;
+  analysis_status: string;
+  house_type: string | null;
+  area: number | null;
+  spaces: unknown;
+  circulation: string | null;
+};
+
+type DesignJobRow = {
+  id: string;
+  project_id: string;
+  floor_plan_id: string;
+  status: string;
+  progress: number;
+  prompt: string | null;
+  provider: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 function getStringValue(value: unknown) {
@@ -53,6 +75,7 @@ function createSpacesText(spaces: unknown) {
 }
 
 function normalizeSpaceType(space: { name: string; type: string }) {
+  // 将模型解析出的中英文空间名称归一化，保证前端展示顺序和生成 prompt 稳定。
   const value = `${space.type} ${space.name}`.toLowerCase();
 
   if (value.includes("living") || space.name.includes("客厅")) {
@@ -129,6 +152,7 @@ const SPACE_PROMPT_FOCUS: Record<string, string> = {
 function createRenderTargets(spaces: unknown): RenderTarget[] {
   const uniqueSpaces = new Map<string, { name: string; type: string; normalizedType: string }>();
 
+  // 同一类空间只生成一个入口，避免“卧室/次卧/Bedroom”重复挤满结果列表。
   for (const space of normalizeSpaces(spaces)) {
     const normalizedType = normalizeSpaceType(space);
     const key = normalizedType === "default" ? space.name : normalizedType;
@@ -160,6 +184,7 @@ function createRenderTargets(spaces: unknown): RenderTarget[] {
   }
 
   return [
+    // 第一张必须是全屋主图：先让用户快速看到总体方案，再按需补单个空间，减少一次性等待时间。
     {
       spaceName: "全屋",
       viewName: "全屋效果图",
@@ -181,6 +206,7 @@ function buildPrompt(
   target: RenderTarget,
 ) {
   if (target.spaceName === "全屋") {
+    // 全屋图要求 3D 轴测/俯视总览，重点是户型关系完整，不是单个房间摄影图。
     return [
       "根据用户上传的户型图，生成一张三维俯视/轴测视角的全屋装修效果图。",
       "固定默认风格：现代简约、明亮通透、暖白与浅木色为主、真实家具软装、干净耐看的家装产品质感。",
@@ -200,6 +226,7 @@ function buildPrompt(
   }
 
   return [
+    // 空间图是局部 2D 室内效果图，但仍引用户型解析结果，保持风格和空间关系一致。
     `生成一张真实可用的${target.spaceName}装修效果图。`,
     "画面要求：室内设计摄影级渲染、真实材质、自然光线、广角视角、完整空间关系、客餐厅与相邻空间联动、现代家装产品图质感。",
     "不要生成户型平面图，不要生成 2D 图纸，不要生成手绘图，不要生成施工图。",
@@ -222,28 +249,13 @@ async function uploadGeneratedImage(params: {
   projectId: string;
   jobId: string;
 }) {
-  const supabase = createSupabaseAdminClient();
-  const storagePath = `renders/${params.projectId}/${params.jobId}-${randomUUID()}.png`;
-
-  const { error: uploadError } = await supabase.storage
-    .from(DESIGN_ASSETS_BUCKET)
-    .upload(storagePath, params.imageBuffer, {
-      contentType: "image/png",
-      upsert: false,
-    });
-
-  if (uploadError) {
-    throw new Error(`保存生成图片失败：${uploadError.message}`);
-  }
-
-  const {
-    data: { publicUrl },
-  } = supabase.storage.from(DESIGN_ASSETS_BUCKET).getPublicUrl(storagePath);
-
-  return {
-    publicUrl,
-    storagePath,
-  };
+  return saveDesignAsset({
+    buffer: params.imageBuffer,
+    contentType: "image/png",
+    extension: `-${params.jobId}-${randomUUID()}.png`,
+    prefix: "renders",
+    projectId: params.projectId,
+  });
 }
 
 async function markJobFailed(params: {
@@ -251,29 +263,26 @@ async function markJobFailed(params: {
   jobId?: string;
   errorMessage: string;
 }) {
-  const supabase = createSupabaseAdminClient();
-  const now = new Date().toISOString();
+  const sql = createPostgresClient();
 
+  // 任一生成阶段失败都同步回写任务和项目状态，前端据此退出“生成中”。
   if (params.jobId) {
-    await supabase
-      .from("design_generation_jobs")
-      .update({
-        status: "failed",
-        progress: 100,
-        error_message: params.errorMessage,
-        completed_at: now,
-        updated_at: now,
-      })
-      .eq("id", params.jobId);
+    await sql`
+      update public.design_generation_jobs
+      set status = 'failed',
+          progress = 100,
+          error_message = ${params.errorMessage},
+          completed_at = now(),
+          updated_at = now()
+      where id = ${params.jobId}
+    `;
   }
 
-  await supabase
-    .from("design_projects")
-    .update({
-      status: "failed",
-      updated_at: now,
-    })
-    .eq("id", params.projectId);
+  await sql`
+    update public.design_projects
+    set status = 'failed', updated_at = now()
+    where id = ${params.projectId}
+  `;
 }
 
 async function generateRenderForTarget(params: {
@@ -289,6 +298,7 @@ async function generateRenderForTarget(params: {
   target: RenderTarget;
 }) {
   const targetPrompt = buildPrompt(params.intentText, params.floorPlan, params.target);
+  // 这里调用真实 DashScope 生图服务，生成完成后下载图片并转存到本地 public/uploads。
   const generatedImage = await generateInteriorDesignImage(targetPrompt);
   const uploadedImage = await uploadGeneratedImage({
     imageBuffer: generatedImage.imageBuffer,
@@ -341,19 +351,19 @@ export async function POST(request: Request) {
     }
 
     projectIdForFailure = projectId;
-    const supabase = createSupabaseAdminClient();
-    const { data: floorPlan, error: floorPlanError } = await supabase
-      .from("design_floor_plans")
-      .select("id,project_id,analysis_status,house_type,area,spaces,circulation")
-      .eq("id", floorPlanId)
-      .eq("project_id", projectId)
-      .single();
+    const sql = createPostgresClient();
+    const [floorPlan] = await sql<FloorPlanForRender[]>`
+      select id,project_id,analysis_status,house_type,area,spaces,circulation
+      from public.design_floor_plans
+      where id = ${floorPlanId} and project_id = ${projectId}
+      limit 1
+    `;
 
-    if (floorPlanError || !floorPlan) {
+    if (!floorPlan) {
       return NextResponse.json(
         {
           ok: false,
-          error: floorPlanError?.message || "户型图不存在",
+          error: "户型图不存在",
         },
         { status: 404 },
       );
@@ -369,9 +379,9 @@ export async function POST(request: Request) {
       );
     }
 
-    const now = new Date().toISOString();
     const renderTargets = createRenderTargets(floorPlan.spaces);
     const wholeHomeTarget = renderTargets[0];
+    // 任务 prompt 保存的是本次生成概要，单张图片的完整 prompt 写入 DashScope 请求和 render metadata。
     const prompt = [
       "全屋效果图生成任务。",
       `本次先生成主图：${wholeHomeTarget.spaceName} · ${wholeHomeTarget.viewName}`,
@@ -385,41 +395,39 @@ export async function POST(request: Request) {
       `用户需求：${intentText || "现代简约，明亮通透，耐脏好打理，预算中等"}`,
     ].join("\n");
 
-    await supabase
-      .from("design_projects")
-      .update({
-        status: "generating",
-        intent_text: intentText,
-        updated_at: now,
-      })
-      .eq("id", projectId);
+    await sql`
+      update public.design_projects
+      set status = 'generating', intent_text = ${intentText}, updated_at = now()
+      where id = ${projectId}
+    `;
 
-    const { data: job, error: jobError } = await supabase
-      .from("design_generation_jobs")
-      .insert({
-        project_id: projectId,
-        floor_plan_id: floorPlanId,
-        status: "running",
-        progress: 20,
+    const [job] = await sql<DesignJobRow[]>`
+      insert into public.design_generation_jobs (
+        project_id,
+        floor_plan_id,
+        status,
+        progress,
         prompt,
-        provider: "dashscope",
-        model: process.env.DASHSCOPE_IMAGE_MODEL || "wan2.7-image",
-        started_at: now,
-        updated_at: now,
-      })
-      .select("id,project_id,floor_plan_id,status,progress,prompt,provider,model,created_at,updated_at")
-      .single();
+        provider,
+        model,
+        started_at,
+        updated_at
+      )
+      values (
+        ${projectId},
+        ${floorPlanId},
+        'running',
+        20,
+        ${prompt},
+        'dashscope',
+        ${process.env.DASHSCOPE_IMAGE_MODEL || "wan2.7-image"},
+        now(),
+        now()
+      )
+      returning id,project_id,floor_plan_id,status,progress,prompt,provider,model,created_at,updated_at
+    `;
 
-    if (jobError || !job) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: jobError?.message || "创建生成任务失败",
-        },
-        { status: 500 },
-      );
-    }
-
+    // 创建任务接口只生成全屋主图；各空间图由 /spaces 接口按用户点击再生成，避免首屏等待过长。
     const generatedRender = await generateRenderForTarget({
       floorPlan,
       intentText,
@@ -428,49 +436,56 @@ export async function POST(request: Request) {
       target: wholeHomeTarget,
     });
 
-    const { data: render, error: renderError } = await supabase
-      .from("design_renders")
-      .insert(generatedRender.renderRow)
-      .select("id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at")
-      .single();
+    const [render] = await sql`
+      insert into public.design_renders (
+        project_id,
+        job_id,
+        space_name,
+        view_name,
+        image_url,
+        thumbnail_url,
+        sort_order,
+        metadata
+      )
+      values (
+        ${generatedRender.renderRow.project_id},
+        ${generatedRender.renderRow.job_id},
+        ${generatedRender.renderRow.space_name},
+        ${generatedRender.renderRow.view_name},
+        ${generatedRender.renderRow.image_url},
+        ${generatedRender.renderRow.thumbnail_url},
+        ${generatedRender.renderRow.sort_order},
+        ${sql.json(generatedRender.renderRow.metadata)}
+      )
+      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at
+    `;
 
-    if (renderError || !render) {
-      throw new Error(renderError?.message || "保存全屋效果图失败");
-    }
+    const responsePayload = {
+      provider: "dashscope",
+      primary_render: generatedRender.task,
+      // available_spaces 给前端渲染“可继续生成”的空间按钮，不代表这些图片已经生成。
+      available_spaces: renderTargets.slice(1).map((target) => ({
+        space_name: target.spaceName,
+        view_name: target.viewName,
+        sort_order: target.sortOrder,
+      })),
+    };
+    const [completedJob] = await sql`
+      update public.design_generation_jobs
+      set status = 'completed',
+          progress = 100,
+          completed_at = now(),
+          updated_at = now(),
+          response_payload = ${sql.json(responsePayload)}
+      where id = ${job.id}
+      returning id,project_id,floor_plan_id,status,progress,prompt,provider,model,created_at,updated_at,completed_at
+    `;
 
-    const completedAt = new Date().toISOString();
-    const { data: completedJob, error: completeJobError } = await supabase
-      .from("design_generation_jobs")
-      .update({
-        status: "completed",
-        progress: 100,
-        completed_at: completedAt,
-        updated_at: completedAt,
-        response_payload: {
-          provider: "dashscope",
-          primary_render: generatedRender.task,
-          available_spaces: renderTargets.slice(1).map((target) => ({
-            space_name: target.spaceName,
-            view_name: target.viewName,
-            sort_order: target.sortOrder,
-          })),
-        },
-      })
-      .eq("id", job.id)
-      .select("id,project_id,floor_plan_id,status,progress,prompt,provider,model,created_at,updated_at,completed_at")
-      .single();
-
-    if (completeJobError || !completedJob) {
-      throw new Error(completeJobError?.message || "更新生成任务失败");
-    }
-
-    await supabase
-      .from("design_projects")
-      .update({
-        status: "completed",
-        updated_at: completedAt,
-      })
-      .eq("id", projectId);
+    await sql`
+      update public.design_projects
+      set status = 'completed', updated_at = now()
+      where id = ${projectId}
+    `;
 
     return NextResponse.json({
       ok: true,
