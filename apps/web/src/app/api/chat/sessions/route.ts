@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
+import { createPostgresClient } from "@/lib/db/postgres";
 
 function createDefaultTitle() {
   // 新建会话时先用默认标题。
@@ -10,22 +10,19 @@ function createDefaultTitle() {
 
 export async function GET() {
   try {
-    const supabase = createSupabaseAdminClient();
+    const sql = createPostgresClient();
     // 左侧栏只需要会话列表，不需要把每条消息都查出来。
     // 这样页面首次加载更轻，点击某个会话时再单独加载 messages。
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .select("id,title,created_at,updated_at")
-      .order("updated_at", { ascending: false })
-      .limit(30);
-
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
-    }
+    const sessions = await sql`
+      select id, title, created_at, updated_at
+      from public.chat_sessions
+      order by updated_at desc
+      limit 30
+    `;
 
     return NextResponse.json({
       ok: true,
-      sessions: data || [],
+      sessions,
     });
   } catch (error) {
     return NextResponse.json(
@@ -40,25 +37,18 @@ export async function GET() {
 
 export async function POST() {
   try {
-    const supabase = createSupabaseAdminClient();
+    const sql = createPostgresClient();
     // 点击“新对话”时创建真实 chat_session。
     // 当前还没有登录系统，所以 user_id 暂时为空。
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .insert({
-        title: createDefaultTitle(),
-        updated_at: new Date().toISOString(),
-      })
-      .select("id,title,created_at,updated_at")
-      .single();
-
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
-    }
+    const [session] = await sql`
+      insert into public.chat_sessions (title, updated_at)
+      values (${createDefaultTitle()}, now())
+      returning id, title, created_at, updated_at
+    `;
 
     return NextResponse.json({
       ok: true,
-      session: data,
+      session,
     });
   } catch (error) {
     return NextResponse.json(

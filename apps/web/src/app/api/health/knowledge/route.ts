@@ -1,32 +1,26 @@
 import { NextResponse } from "next/server";
 
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
+import { createPostgresClient } from "@/lib/db/postgres";
 
 async function getTableCount(tableName: string) {
-  const supabase = createSupabaseAdminClient();
-  const { count, error } = await supabase
-    .from(tableName)
-    .select("*", { count: "exact", head: true });
+  const sql = createPostgresClient();
+  const [row] = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from ${sql("public", tableName)}
+  `;
 
-  if (error) {
-    throw new Error(`Failed to count ${tableName}: ${error.message}`);
-  }
-
-  return count || 0;
+  return Number(row?.count || 0);
 }
 
 async function getMissingEmbeddingCount() {
-  const supabase = createSupabaseAdminClient();
-  const { count, error } = await supabase
-    .from("knowledge_chunks")
-    .select("*", { count: "exact", head: true })
-    .is("embedding", null);
+  const sql = createPostgresClient();
+  const [row] = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from public.knowledge_chunks
+    where embedding is null
+  `;
 
-  if (error) {
-    throw new Error(`Failed to count missing embeddings: ${error.message}`);
-  }
-
-  return count || 0;
+  return Number(row?.count || 0);
 }
 
 export async function GET() {

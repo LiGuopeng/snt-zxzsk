@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
+import { createPostgresClient } from "@/lib/db/postgres";
 
 type RouteContext = {
   params: Promise<{
@@ -11,27 +11,20 @@ type RouteContext = {
 export async function DELETE(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const supabase = createSupabaseAdminClient();
+    const sql = createPostgresClient();
 
     // 删除单个对话时，只处理聊天表。
     // 知识库 documents/chunks 不会受影响。
-    const { error: messagesError } = await supabase
-      .from("chat_messages")
-      .delete()
-      .eq("session_id", id);
-
-    if (messagesError) {
-      return NextResponse.json({ ok: false, error: messagesError.message }, { status: 500 });
-    }
-
-    const { error: sessionError } = await supabase
-      .from("chat_sessions")
-      .delete()
-      .eq("id", id);
-
-    if (sessionError) {
-      return NextResponse.json({ ok: false, error: sessionError.message }, { status: 500 });
-    }
+    await sql.begin(async (transaction) => {
+      await transaction`
+        delete from public.chat_messages
+        where session_id = ${id}
+      `;
+      await transaction`
+        delete from public.chat_sessions
+        where id = ${id}
+      `;
+    });
 
     return NextResponse.json({ ok: true });
   } catch (error) {

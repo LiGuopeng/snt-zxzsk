@@ -1,6 +1,5 @@
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
-
 import type { IntentProfile } from "@/lib/ai/intent";
+import { createPostgresClient, toVectorLiteral } from "@/lib/db/postgres";
 
 export type KnowledgeChunk = {
   id: string;
@@ -93,28 +92,25 @@ export async function matchKnowledgeChunks(
     layerFilter?: string | null;
   },
 ) {
-  // 这里调用 infra/supabase/schema.sql 里已经创建好的 RPC：
+  // 这里调用 infra/supabase/schema.sql 里已经创建好的数据库函数：
   // public.match_knowledge_chunks(query_embedding, match_count, layer_filter)
   //
-  // 它会在 Supabase pgvector 中按 cosine similarity 找最相关的知识片段。
-  const supabase = createSupabaseAdminClient();
-  const { data, error } = await supabase.rpc("match_knowledge_chunks", {
-    query_embedding: queryEmbedding,
-    match_count: options?.matchCount || DEFAULT_MATCH_COUNT,
-    layer_filter: options?.layerFilter || null,
-  });
+  // 它会在 pgvector 中按 cosine similarity 找最相关的知识片段。
+  const sql = createPostgresClient();
+  const rows = await sql<KnowledgeChunk[]>`
+    select *
+    from public.match_knowledge_chunks(
+      ${toVectorLiteral(queryEmbedding)}::vector,
+      ${options?.matchCount || DEFAULT_MATCH_COUNT},
+      ${options?.layerFilter || null}
+    )
+  `;
 
-  if (error) {
-    throw new Error(`Failed to match knowledge chunks: ${error.message}`);
-  }
-
-  return (data || []) as KnowledgeChunk[];
+  return rows as KnowledgeChunk[];
 }
 
 function escapeIlikeValue(value: string) {
-  // Supabase PostgREST 的 ilike 过滤里会用到用户问题派生出的关键词。
-  // 这里做最小转义，避免逗号、百分号等字符影响查询语法。
-  return value.replace(/[%_,]/g, "").trim();
+  return value.replace(/[%_]/g, "").trim();
 }
 
 function scoreKeywordChunk(chunk: KnowledgeChunk, keywords: string[]) {
@@ -145,33 +141,41 @@ async function matchKeywordKnowledgeChunks(
     layerFilter?: string | null;
   },
 ) {
-  const supabase = createSupabaseAdminClient();
+  const sql = createPostgresClient();
   const keywords = intentProfile.fallbackKeywords.map(escapeIlikeValue).filter(Boolean);
   const merged: KnowledgeChunk[] = [];
   const seen = new Set<string>();
 
   for (const keyword of keywords) {
-    let query = supabase
-      .from("knowledge_chunks")
-      .select(
-        "id,document_id,title,section,content,source_file,layer,module,doc_type,stage,risk_level,keywords",
-      )
-      .or(
-        `content.ilike.%${keyword}%,title.ilike.%${keyword}%,section.ilike.%${keyword}%,source_file.ilike.%${keyword}%,module.ilike.%${keyword}%`,
-      )
-      .limit(KEYWORD_QUERY_LIMIT);
+    const pattern = `%${keyword}%`;
+    const rows = await sql<Omit<KnowledgeChunk, "similarity">[]>`
+      select
+        id,
+        document_id,
+        title,
+        section,
+        content,
+        source_file,
+        layer,
+        module,
+        doc_type,
+        stage,
+        risk_level,
+        keywords
+      from public.knowledge_chunks
+      where
+        (${options?.layerFilter || null}::text is null or layer = ${options?.layerFilter || null})
+        and (
+          content ilike ${pattern}
+          or title ilike ${pattern}
+          or section ilike ${pattern}
+          or source_file ilike ${pattern}
+          or module ilike ${pattern}
+        )
+      limit ${KEYWORD_QUERY_LIMIT}
+    `;
 
-    if (options?.layerFilter) {
-      query = query.eq("layer", options.layerFilter);
-    }
-
-    const { data, error } = await query;
-
-    if (error) {
-      throw new Error(`Failed to keyword match knowledge chunks: ${error.message}`);
-    }
-
-    for (const chunk of data || []) {
+    for (const chunk of rows) {
       if (seen.has(chunk.id)) {
         continue;
       }

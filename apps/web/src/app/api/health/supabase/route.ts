@@ -1,28 +1,19 @@
 import { NextResponse } from "next/server";
 
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
+import { createPostgresClient } from "@/lib/db/postgres";
 
 export async function GET() {
   try {
-    const supabase = createSupabaseAdminClient();
-    const { error } = await supabase
-      .from("knowledge_documents")
-      .select("id")
-      .limit(1);
-
-    if (error) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: error.message,
-        },
-        { status: 500 },
-      );
-    }
+    const sql = createPostgresClient();
+    await sql`
+      select id
+      from public.knowledge_documents
+      limit 1
+    `;
 
     return NextResponse.json({
       ok: true,
-      message: "Supabase connection is ready.",
+      message: "PostgreSQL connection is ready.",
     });
   } catch (error) {
     return NextResponse.json(
@@ -34,4 +25,3 @@ export async function GET() {
     );
   }
 }
-

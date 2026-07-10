@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
+import { createPostgresClient } from "@/lib/db/postgres";
 
 type RouteContext = {
   params: Promise<{
@@ -11,22 +11,19 @@ type RouteContext = {
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const supabase = createSupabaseAdminClient();
+    const sql = createPostgresClient();
     // 点击左侧某个会话时，根据 session_id 加载这个会话的完整消息。
     // sources 存在 assistant 消息里，用于前端折叠展示“参考来源”。
-    const { data, error } = await supabase
-      .from("chat_messages")
-      .select("id,role,content,sources,created_at")
-      .eq("session_id", id)
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
-    }
+    const messages = await sql`
+      select id, role, content, sources, created_at
+      from public.chat_messages
+      where session_id = ${id}
+      order by created_at asc
+    `;
 
     return NextResponse.json({
       ok: true,
-      messages: data || [],
+      messages,
     });
   } catch (error) {
     return NextResponse.json(

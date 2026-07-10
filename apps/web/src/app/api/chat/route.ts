@@ -8,7 +8,7 @@ import {
   prepareRetrievedKnowledge,
   retrieveKnowledgeForQuestion,
 } from "@/lib/ai/retrieval";
-import { createSupabaseAdminClient } from "@/lib/supabase/server";
+import { createPostgresClient } from "@/lib/db/postgres";
 
 type ChatRequestBody = {
   message?: unknown;
@@ -57,29 +57,28 @@ function createTitleFromMessage(message: string) {
 }
 
 async function loadRecentHistory(sessionId: string) {
-  const supabase = createSupabaseAdminClient();
+  const sql = createPostgresClient();
 
   // 查询当前 session 最近几条历史消息。
   // 注意：这个函数在写入当前 user message 之前调用，
   // 所以查到的是“真正的上文”，不会把当前问题重复放进历史。
-  const { data, error } = await supabase
-    .from("chat_messages")
-    .select("role,content,created_at")
-    .eq("session_id", sessionId)
-    .in("role", ["user", "assistant"])
-    .order("created_at", { ascending: false })
-    .limit(HISTORY_LIMIT);
+  const rows = await sql<PromptHistoryMessage[]>`
+    select role, content
+    from (
+      select role, content, created_at
+      from public.chat_messages
+      where session_id = ${sessionId}
+        and role in ('user', 'assistant')
+      order by created_at desc
+      limit ${HISTORY_LIMIT}
+    ) recent_messages
+    order by created_at asc
+  `;
 
-  if (error) {
-    throw new Error(`Failed to load chat history: ${error.message}`);
-  }
-
-  return (data || [])
-    .reverse()
-    .map((message) => ({
-      role: message.role,
-      content: message.content,
-    })) as PromptHistoryMessage[];
+  return rows.map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
 }
 
 function buildHistoryText(history: PromptHistoryMessage[]) {
@@ -148,7 +147,7 @@ export async function POST(request: Request) {
     }
 
     messageForLog = message;
-    const supabase = createSupabaseAdminClient();
+    const sql = createPostgresClient();
     let activeSessionId = sessionId;
     let history: PromptHistoryMessage[] = [];
 
@@ -156,18 +155,11 @@ export async function POST(request: Request) {
     // 如果前端没有传 sessionId，就在后端创建一个新会话。
     // 这样 /api/chat 既支持“已有会话继续问”，也支持“直接发第一句话创建会话”。
     if (!activeSessionId) {
-      const { data: session, error: sessionError } = await supabase
-        .from("chat_sessions")
-        .insert({
-          title: createTitleFromMessage(message),
-          updated_at: new Date().toISOString(),
-        })
-        .select("id")
-        .single();
-
-      if (sessionError) {
-        return NextResponse.json({ ok: false, error: sessionError.message }, { status: 500 });
-      }
+      const [session] = await sql<{ id: string }[]>`
+        insert into public.chat_sessions (title, updated_at)
+        values (${createTitleFromMessage(message)}, now())
+        returning id
+      `;
 
       activeSessionId = session.id;
     } else {
@@ -176,15 +168,10 @@ export async function POST(request: Request) {
     activeSessionIdForLog = activeSessionId;
 
     // 先写入用户消息，保证即使后面模型调用失败，也能在后台看到用户问了什么。
-    const { error: userMessageError } = await supabase.from("chat_messages").insert({
-      session_id: activeSessionId,
-      role: "user",
-      content: message,
-    });
-
-    if (userMessageError) {
-      return NextResponse.json({ ok: false, error: userMessageError.message }, { status: 500 });
-    }
+    await sql`
+      insert into public.chat_messages (session_id, role, content)
+      values (${activeSessionId}, 'user', ${message})
+    `;
 
     // 1. 把用户问题转成 query embedding。
     // 这一步不是重复生成知识库 embedding，而是给“本次用户问题”生成查询向量。
@@ -208,12 +195,10 @@ export async function POST(request: Request) {
       const fallbackAnswer =
         "目前没有检索到足够相关的知识库资料，暂时不能直接判断。你可以补充装修阶段、现场照片描述、合同或报价明细，我再帮你继续分析。";
 
-      await supabase.from("chat_messages").insert({
-        session_id: activeSessionId,
-        role: "assistant",
-        content: fallbackAnswer,
-        sources,
-      });
+      await sql`
+        insert into public.chat_messages (session_id, role, content, sources)
+        values (${activeSessionId}, 'assistant', ${fallbackAnswer}, ${sql.json(sources)})
+      `;
 
       await writeChatRequestLog({
         sessionId: activeSessionId,
@@ -243,29 +228,18 @@ export async function POST(request: Request) {
     const answer = await generateChatAnswer(messages);
 
     // 写入 AI 回复和来源，左侧点击会话恢复时会用到。
-    const { error: assistantMessageError } = await supabase.from("chat_messages").insert({
-      session_id: activeSessionId,
-      role: "assistant",
-      content: answer,
-      sources,
-    });
-
-    if (assistantMessageError) {
-      return NextResponse.json(
-        { ok: false, error: assistantMessageError.message },
-        { status: 500 },
-      );
-    }
+    await sql`
+      insert into public.chat_messages (session_id, role, content, sources)
+      values (${activeSessionId}, 'assistant', ${answer}, ${sql.json(sources)})
+    `;
 
     // 更新会话标题和更新时间。
     // 如果还是“新对话”，用用户第一句话替换；已有标题则只更新时间。
-    await supabase
-      .from("chat_sessions")
-      .update({
-        title: createTitleFromMessage(message),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", activeSessionId);
+    await sql`
+      update public.chat_sessions
+      set title = ${createTitleFromMessage(message)}, updated_at = now()
+      where id = ${activeSessionId}
+    `;
 
     await writeChatRequestLog({
       sessionId: activeSessionId,
