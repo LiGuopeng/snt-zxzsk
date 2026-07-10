@@ -48,10 +48,12 @@ type DesignJobRow = {
 };
 
 function getStringValue(value: unknown) {
+  // API body 是外部输入，先收敛成 string | null，再参与 SQL 查询和 prompt 拼接。
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function normalizeSpaces(spaces: unknown) {
+  // 户型解析由模型返回，结构可能不稳定；生成前只提取空间名和类型这两个必需字段。
   if (!Array.isArray(spaces)) {
     return [];
   }
@@ -114,6 +116,7 @@ function normalizeSpaceType(space: { name: string; type: string }) {
 }
 
 const SPACE_PRIORITY: Record<string, number> = {
+  // 结果展示顺序：先公共空间，再卧室、厨卫和其他空间，符合用户看全屋方案的习惯。
   living_room: 1,
   dining_room: 2,
   master_bedroom: 3,
@@ -126,6 +129,7 @@ const SPACE_PRIORITY: Record<string, number> = {
 };
 
 const SPACE_VIEW_NAME: Record<string, string> = {
+  // viewName 会写入 design_renders 并展示在前端卡片上，保持中文可读。
   living_room: "客餐厅效果图",
   dining_room: "餐厅效果图",
   master_bedroom: "主卧效果图",
@@ -138,6 +142,7 @@ const SPACE_VIEW_NAME: Record<string, string> = {
 };
 
 const SPACE_PROMPT_FOCUS: Record<string, string> = {
+  // 各空间 prompt 重点不同，避免所有空间都生成成相似的通用室内图。
   living_room: "重点展示客厅与餐厅的联动关系、沙发布局、电视墙、餐桌、采光和全屋主色调。",
   dining_room: "重点展示餐桌、餐边柜、餐厨关系、灯光和材质搭配。",
   master_bedroom: "重点展示主卧床区、床头背景、衣柜、柔和灯光和睡眠氛围。",
@@ -249,6 +254,7 @@ async function uploadGeneratedImage(params: {
   projectId: string;
   jobId: string;
 }) {
+  // 文件名携带 jobId，后续排查某张图片来源时可以从文件路径反查生成任务。
   return saveDesignAsset({
     buffer: params.imageBuffer,
     contentType: "image/png",
@@ -335,6 +341,7 @@ export async function POST(request: Request) {
   let projectIdForFailure: string | undefined;
 
   try {
+    // 生成任务必须同时绑定 project 和 floor_plan，防止跨项目复用户型图生成。
     const body = (await request.json().catch(() => null)) as CreateDesignJobBody | null;
     const projectId = getStringValue(body?.projectId);
     const floorPlanId = getStringValue(body?.floorPlanId);
@@ -401,6 +408,7 @@ export async function POST(request: Request) {
       where id = ${projectId}
     `;
 
+    // design_generation_jobs 记录一次生成任务的生命周期；即使生图失败，也能回查 prompt 和错误状态。
     const [job] = await sql<DesignJobRow[]>`
       insert into public.design_generation_jobs (
         project_id,

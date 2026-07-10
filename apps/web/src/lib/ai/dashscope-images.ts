@@ -18,10 +18,12 @@ function getDashScopeApiKey() {
 }
 
 function getDashScopeImageModel() {
+  // 生图模型通过环境变量控制，方便在速度/质量之间切换，不需要改业务代码。
   return process.env.DASHSCOPE_IMAGE_MODEL || DEFAULT_DASHSCOPE_IMAGE_MODEL;
 }
 
 function getDashScopeImageSize() {
+  // 默认 1K 是为了控制生成耗时；后续如果做高清下载，可以单独开二次放大流程。
   return process.env.DASHSCOPE_IMAGE_SIZE || DEFAULT_DASHSCOPE_IMAGE_SIZE;
 }
 
@@ -56,6 +58,7 @@ function sleep(ms: number) {
 }
 
 async function parseJsonResponse(response: Response) {
+  // DashScope 错误信息通常在 JSON body 里，保留下来方便前端和日志定位具体参数问题。
   const payload = await response.json().catch(() => null);
 
   if (!response.ok) {
@@ -94,6 +97,8 @@ function getTaskStatus(payload: Record<string, unknown>) {
 }
 
 function getImageUrl(payload: Record<string, unknown>) {
+  // 不同 DashScope 生图模型返回结构可能是 output.results，也可能兼容 OpenAI 风格 choices。
+  // 这里兼容两类结构，避免以后切模型时接口直接失效。
   const output = payload.output;
 
   if (!output || typeof output !== "object") {
@@ -156,6 +161,7 @@ function getImageUrl(payload: Record<string, unknown>) {
 }
 
 async function createImageTask(prompt: string) {
+  // 生图走异步任务：先创建 task_id，再轮询结果。同步等待会更容易超时。
   const response = await fetch(getDashScopeImageCreateUrl(), {
     method: "POST",
     headers: {
@@ -204,12 +210,14 @@ export async function generateInteriorDesignImage(prompt: string) {
   const taskId = await createImageTask(prompt);
   const deadline = Date.now() + getDashScopeImageTimeoutMs();
 
+  // 轮询直到成功、失败或超时。接口层会把失败状态写入 design_generation_jobs。
   while (Date.now() < deadline) {
     const payload = await queryImageTask(taskId);
     const status = getTaskStatus(payload);
 
     if (status === "SUCCEEDED") {
       const imageUrl = getImageUrl(payload);
+      // DashScope 返回的是临时图片地址，必须下载并转存到本项目文件目录，避免链接过期。
       const imageResponse = await fetch(imageUrl);
 
       if (!imageResponse.ok) {

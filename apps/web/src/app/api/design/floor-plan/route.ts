@@ -17,6 +17,7 @@ const ALLOWED_FILE_TYPES = new Set([
 ]);
 
 function getStringField(formData: FormData, key: string) {
+  // FormData 中除文件外还有用户补充需求；空字符串统一按 null 入库，避免后续 prompt 出现无意义空值。
   const value = formData.get(key);
 
   if (typeof value !== "string") {
@@ -30,6 +31,7 @@ function getStringField(formData: FormData, key: string) {
 
 export async function POST(request: Request) {
   try {
+    // 上传接口只做“创建项目 + 保存户型原图 + 写入 floor_plan”，AI 解析交给独立接口处理。
     const formData = await request.formData();
     const file = formData.get("file");
 

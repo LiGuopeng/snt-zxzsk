@@ -146,6 +146,7 @@ async function parseDashScopeResponse(response: Response) {
 }
 
 export async function createQueryEmbedding(question: string) {
+  // 知识库检索先把用户问题转成 query embedding，再去 PostgreSQL/pgvector 做相似度召回。
   const response = await fetch(getDashScopeEmbeddingsUrl(), {
     method: "POST",
     headers: {
@@ -177,6 +178,7 @@ export async function createQueryEmbedding(question: string) {
 }
 
 export async function generateChatAnswer(messages: ChatMessage[]) {
+  // 回答生成只负责调用模型；知识库上下文、系统提示词等在上层 prompt 组装，职责分开。
   const response = await fetch(getDashScopeChatCompletionsUrl(), {
     method: "POST",
     headers: {
@@ -202,6 +204,7 @@ export async function generateChatAnswer(messages: ChatMessage[]) {
 }
 
 function extractJsonObject(content: string) {
+  // 视觉模型偶尔会包一层 ```json，这里只截取 JSON 对象，后续再做结构化归一化。
   const trimmed = content.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const jsonText = fenced?.[1]?.trim() || trimmed;
@@ -222,6 +225,7 @@ function normalizeNullableText(value: unknown) {
 
   const text = value.trim();
 
+  // 避免模型把 prompt 示例里的占位说明原样返回，前端误以为这是有效解析结论。
   if (!text || text.includes("无法确认则为 null")) {
     return null;
   }
@@ -235,6 +239,7 @@ function normalizeFloorPlanAnalysis(payload: unknown): FloorPlanAnalysis {
   }
 
   const record = payload as Record<string, unknown>;
+  // 视觉模型返回值不完全稳定，所有数组字段都要逐项清洗，保证写入数据库的是可控结构。
   const spaces = Array.isArray(record.spaces)
     ? record.spaces
         .filter((space): space is Record<string, unknown> => Boolean(space) && typeof space === "object")

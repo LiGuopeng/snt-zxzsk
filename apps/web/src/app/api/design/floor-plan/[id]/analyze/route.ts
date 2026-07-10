@@ -19,6 +19,7 @@ type FloorPlanRecord = {
 };
 
 function createSpacesSummary(spaces: Array<{ name: string }>) {
+  // 给前端一个轻量空间摘要；完整结构仍以 spaces/analysis_result 为准。
   return spaces.map((space) => space.name).filter(Boolean).join("、");
 }
 
@@ -55,6 +56,7 @@ export async function POST(_request: Request, context: RouteContext) {
     }
 
     if (floorPlan.file_type === "application/pdf") {
+      // PDF 需要先转图片再给视觉模型；当前阶段明确拒绝，避免任务长时间停在 analyzing。
       const errorMessage = "暂不支持直接解析 PDF，请先上传 JPG、PNG 或 WEBP 户型图";
 
       await sql`
@@ -90,6 +92,7 @@ export async function POST(_request: Request, context: RouteContext) {
       storagePath: floorPlan.storage_path,
     });
 
+    // DashScope 云端不能访问本机 /uploads 相对路径，所以这里传 data URL 图片内容。
     // 真实户型解析入口：DashScope 视觉模型根据户型图识别房间、面积、门窗、厨卫、阳台和动线。
     const analysis = await analyzeFloorPlanImage(imageDataUrl);
     const spacesSummary = createSpacesSummary(analysis.spaces);
