@@ -38,7 +38,9 @@ const MAX_MESSAGE_CHARS = 1000;
 const HISTORY_LIMIT = 6;
 const QUESTION_REWRITE_TIMEOUT_MS = Number(process.env.CHAT_REWRITE_TIMEOUT_MS || 8000);
 const ANSWER_EVIDENCE_TIMEOUT_MS = Number(process.env.CHAT_EVIDENCE_TIMEOUT_MS || 10000);
-const ANSWER_EVIDENCE_SOURCE_LIMIT = 4;
+const SIMPLE_EVIDENCE_SOURCE_LIMIT = 2;
+const NORMAL_EVIDENCE_SOURCE_LIMIT = 3;
+const COMPLEX_EVIDENCE_SOURCE_LIMIT = 4;
 
 /**
  * 创建流式接口使用的阶段计时器。
@@ -253,6 +255,40 @@ function createStreamError(error: unknown) {
 }
 
 /**
+ * 判断本次问题需要展示多少条依据。
+ * 这里故意用可解释规则，而不是再调用一次模型：快、稳定，也方便后期按业务反馈调整。
+ */
+function getEvidenceSourceLimit(question: string, intentProfile: ReturnType<typeof detectIntentProfile>) {
+  const compactQuestion = question.replace(/\s+/g, "");
+  const complexLabels = ["合同签约", "付款报价", "维权争议", "安全风险"];
+  const hasComplexLabel = intentProfile.labels.some((label) => complexLabels.includes(label));
+  const asksForProcess = intentProfile.detailLevel === "detailed";
+  const isLongQuestion = compactQuestion.length >= 40;
+  const hasMultipleSignals = intentProfile.labels.length >= 2;
+
+  if (asksForProcess || isLongQuestion || hasComplexLabel || hasMultipleSignals) {
+    return COMPLEX_EVIDENCE_SOURCE_LIMIT;
+  }
+
+  if (compactQuestion.length >= 18 || intentProfile.labels.length === 1) {
+    return NORMAL_EVIDENCE_SOURCE_LIMIT;
+  }
+
+  return SIMPLE_EVIDENCE_SOURCE_LIMIT;
+}
+
+/**
+ * 给检索兜底来源补充 retrieved 模式并按复杂度截断。
+ * 当二次依据筛选失败时，前端会据此显示“知识库检索依据”，避免误称“实际采用依据”。
+ */
+function createRetrievedFallbackSources(sources: KnowledgeSource[], sourceLimit: number) {
+  return sources.slice(0, sourceLimit).map((source) => ({
+    ...source,
+    mode: "retrieved" as const,
+  }));
+}
+
+/**
  * 把候选知识片段整理成“引用判定”模型可读的短文本。
  * 这里只保留 chunk id、来源和截断正文，避免二次判定 prompt 过长。
  */
@@ -301,9 +337,16 @@ function parseEvidenceJson(content: string) {
  * 在回答生成完成后，反向判断“哪些知识片段真正支撑了本次答案”。
  * 注意：这一步不重新检索知识库，只在已经传给回答模型的候选 chunks 里筛选。
  */
-async function selectAnswerSources(answer: string, chunks: KnowledgeChunk[], fallbackSources: KnowledgeSource[]) {
+async function selectAnswerSources(
+  answer: string,
+  chunks: KnowledgeChunk[],
+  fallbackSources: KnowledgeSource[],
+  sourceLimit: number,
+) {
+  const retrievedFallbackSources = createRetrievedFallbackSources(fallbackSources, sourceLimit);
+
   if (!answer.trim() || chunks.length === 0) {
-    return [];
+    return retrievedFallbackSources;
   }
 
   try {
@@ -316,7 +359,7 @@ async function selectAnswerSources(answer: string, chunks: KnowledgeChunk[], fal
             "只能从候选资料里选择，不能新增来源。",
             "只选择能直接支撑答案关键结论或建议的资料。",
             "如果某条资料只是相似但答案没有使用，不要选择。",
-            "最多选择 4 条。",
+            `最多选择 ${sourceLimit} 条。`,
             "必须只返回 JSON，不要解释。",
           ].join("\n"),
         },
@@ -356,6 +399,7 @@ async function selectAnswerSources(answer: string, chunks: KnowledgeChunk[], fal
 
       seen.add(item.chunk_id);
       selectedSources.push({
+        mode: "used",
         chunk_id: chunk.id,
         source_file: chunk.source_file,
         section: chunk.section,
@@ -365,14 +409,14 @@ async function selectAnswerSources(answer: string, chunks: KnowledgeChunk[], fal
         reason: typeof item.reason === "string" ? item.reason.trim().slice(0, 60) : undefined,
       });
 
-      if (selectedSources.length >= ANSWER_EVIDENCE_SOURCE_LIMIT) {
+      if (selectedSources.length >= sourceLimit) {
         break;
       }
     }
 
-    return selectedSources.length > 0 ? selectedSources : fallbackSources;
+    return selectedSources.length > 0 ? selectedSources : retrievedFallbackSources;
   } catch {
-    return fallbackSources;
+    return retrievedFallbackSources;
   }
 }
 
@@ -458,7 +502,8 @@ export async function POST(request: Request) {
 
           const prepareStartedAt = Date.now();
           const { chunks, sources } = prepareRetrievedKnowledge(retrievalResult.chunks);
-          let answerSources = sources;
+          const evidenceSourceLimit = getEvidenceSourceLimit(retrievalQuestion, intentProfile);
+          let answerSources: KnowledgeSource[] = createRetrievedFallbackSources(sources, evidenceSourceLimit);
           stageTimer.mark("prepare_knowledge", prepareStartedAt);
 
           if (chunks.length === 0) {
@@ -481,7 +526,7 @@ export async function POST(request: Request) {
 
           writeEvent("stage", { stage: "evidence", label: "正在确认回答依据" });
           answerSources = await stageTimer.track("evidence", () =>
-            selectAnswerSources(answer, chunks, sources),
+            selectAnswerSources(answer, chunks, sources, evidenceSourceLimit),
           );
 
           await stageTimer.track("write_assistant_message", () => sql`

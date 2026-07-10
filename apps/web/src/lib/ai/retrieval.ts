@@ -31,6 +31,8 @@ export type KnowledgeChunk = {
 };
 
 export type KnowledgeSource = {
+  // 来源模式：used 表示回答后确认采用；retrieved 表示仅为检索兜底依据。
+  mode?: "used" | "retrieved";
   // 对应的 knowledge_chunks.id，用于回答生成后反向筛选“实际采用依据”。
   chunk_id?: string;
   // 前端展示的来源文件。
@@ -112,6 +114,7 @@ function dedupeSources(chunks: KnowledgeChunk[], limit: number) {
 
     seen.add(key);
     sources.push({
+      mode: "retrieved",
       chunk_id: chunk.id,
       source_file: chunk.source_file,
       section: chunk.section,

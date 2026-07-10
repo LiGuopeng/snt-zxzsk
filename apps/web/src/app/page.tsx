@@ -6,6 +6,8 @@ import { ChatWorkspace, type ChatMessage } from "./components/chat-workspace";
 import { DesignWorkspace } from "./components/design-workspace";
 
 type Source = {
+  // used 表示回答后确认采用；retrieved 表示二次筛选失败时的检索兜底来源。
+  mode?: "used" | "retrieved";
   // knowledge_chunks.id；新回答会带上，历史消息可能没有。
   chunk_id?: string;
   // 知识库来源文件。

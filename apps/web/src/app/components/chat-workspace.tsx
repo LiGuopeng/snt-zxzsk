@@ -1,6 +1,8 @@
 import { FormEvent } from "react";
 
 type Source = {
+  // used 表示回答后确认采用；retrieved 表示二次筛选失败后的检索兜底依据。
+  mode?: "used" | "retrieved";
   // knowledge_chunks.id。新生成回答会带上，历史数据可能为空。
   chunk_id?: string;
   // 来源 Markdown 文件路径，用于用户和开发者追溯知识内容。
@@ -64,6 +66,27 @@ export function ChatWorkspace({
 }: ChatWorkspaceProps) {
   // 是否已经有消息。没有消息时展示产品空态和示例问题；有消息时展示聊天列表。
   const hasMessages = messages.length > 0;
+
+  /**
+   * 根据 sources 的来源模式生成前端展示文案。
+   * used：回答生成后确认采用，可信度更高。
+   * retrieved：二次确认失败时的兜底检索依据，不能冒充“实际采用”。
+   */
+  function getSourceDisplayMeta(sources: Source[]) {
+    const hasUsedSource = sources.some((source) => source.mode === "used" || source.reason);
+
+    if (hasUsedSource) {
+      return {
+        title: `实际采用依据 ${sources.length} 条`,
+        description: "以下为回答生成后再次筛选出的知识库依据，用于说明本次结论主要参考了哪些资料。",
+      };
+    }
+
+    return {
+      title: `知识库检索依据 ${sources.length} 条`,
+      description: "以下为系统检索命中的候选知识资料，用于辅助本次回答，不等同于逐条实际采用。",
+    };
+  }
 
   return (
     <>
@@ -136,10 +159,10 @@ export function ChatWorkspace({
                       {message.sources?.length ? (
                         <details className="mt-4 rounded-lg border border-[#d8e6ff] bg-white/80 p-3">
                           <summary className="cursor-pointer text-sm font-medium text-[#20345d]">
-                            实际采用依据 {message.sources.length} 条
+                            {getSourceDisplayMeta(message.sources).title}
                           </summary>
                           <p className="mt-2 text-xs leading-5 text-[#647399]">
-                            以下为回答生成后再次筛选出的知识库依据，用于说明本次结论主要参考了哪些资料。
+                            {getSourceDisplayMeta(message.sources).description}
                           </p>
                           <div className="mt-3 grid gap-2">
                             {message.sources.map((source, index) => (

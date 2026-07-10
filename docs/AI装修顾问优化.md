@@ -1085,8 +1085,8 @@ selectAnswerSources()
 
 ```text
 在回答生成完成后，根据“最终回答 + 候选知识片段”判断哪些资料真正支撑了答案。
-这一步最多返回 4 条实际采用依据。
-如果判定失败，会回退到原检索 sources，保证用户回答不会因为二次判定失败而中断。
+这一步根据问题复杂度动态返回 1 到 4 条依据。
+如果判定失败，会回退到“知识库检索依据”，保证用户回答不会因为二次判定失败而中断。
 ```
 
 为什么这样做：
@@ -1096,6 +1096,90 @@ selectAnswerSources()
 实际采用依据：回答完成后，系统再判断这次答案真正用了哪些资料。
 
 这一步提升的是可解释性，不是重新检索知识库。
+```
+
+### 2.2.1 回答依据确认放在哪个位置
+
+这一步放在第 2 阶段的后半段，也就是回答已经流式生成完成之后、写入数据库之前。
+
+```text
+generateChatAnswerStream()
+-> answer 已经完整生成
+-> selectAnswerSources()
+-> 根据 answer + chunks 确认实际采用依据
+-> insert chat_messages(content, sources)
+-> writeChatRequestLog(sources)
+-> done 事件返回 answer + sources
+```
+
+为什么放这里：
+
+```text
+1. 放在 retrieval 之前不行：那时还没有答案，只知道候选资料。
+2. 放在 answer 生成过程中不合适：流式 token 还没完成，无法判断最终用了哪些资料。
+3. 放在写库之后也不合适：sources 已经保存，后续再改会让消息记录和日志不一致。
+
+所以最佳位置是：answer 完成后，写库前。
+```
+
+### 2.2.2 动态依据数量规则
+
+依据数量不再固定 4 条，而是根据问题复杂度控制上限。
+
+```text
+简单问题：最多 2 条依据。
+普通问题：最多 3 条依据。
+复杂问题：最多 4 条依据。
+```
+
+判断方法在：
+
+```text
+apps/web/src/app/api/chat/route.ts
+getEvidenceSourceLimit()
+```
+
+判断依据：
+
+```text
+1. 用户是否要求“详细、步骤、清单、流程、怎么做”。
+2. 问题长度是否较长。
+3. 是否命中合同、付款、维权、安全风险等复杂标签。
+4. 是否同时命中多个意图标签。
+```
+
+链路：
+
+```text
+detectIntentProfile(retrievalQuestion)
+-> 得到 detailLevel 和 labels
+-> getEvidenceSourceLimit(retrievalQuestion, intentProfile)
+-> 返回 2 / 3 / 4
+-> selectAnswerSources(..., sourceLimit)
+-> 控制最终 sources 数量
+```
+
+### 2.2.3 used 和 retrieved 的区别
+
+现在 sources 增加了 `mode` 字段。
+
+```text
+mode = used
+表示回答生成后，系统确认这条资料实际支撑了本次回答。
+前端展示：实际采用依据 N 条。
+```
+
+```text
+mode = retrieved
+表示二次依据确认失败，系统退回到原始检索命中的候选资料。
+前端展示：知识库检索依据 N 条。
+```
+
+这样做的意义：
+
+```text
+如果二次判断成功，用户看到“实际采用依据”，专业感更强。
+如果二次判断失败，系统不冒充实际引用，只展示“知识库检索依据”，表达更诚实。
 ```
 
 ### 2.3 前端文件和方法
@@ -1138,7 +1222,9 @@ apps/web/src/app/components/chat-workspace.tsx
 
 ```text
 原来显示：知识库依据 N 条。
-现在显示：实际采用依据 N 条。
+现在根据 sources.mode 动态显示：
+- used：实际采用依据 N 条。
+- retrieved：知识库检索依据 N 条。
 
 每条依据可展示：
 - 知识库层级
