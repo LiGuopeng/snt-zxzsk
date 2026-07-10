@@ -1,16 +1,20 @@
 type ChatRole = "system" | "user" | "assistant";
 
 export type ChatMessage = {
+  // OpenAI 兼容 chat/completions 的角色。
   role: ChatRole;
+  // 当前消息文本内容。
   content: string;
 };
 
 type VisionContent =
   | {
+      // 视觉模型里的文本指令。
       type: "text";
       text: string;
     }
   | {
+      // 视觉模型里的图片输入，可以是公网 URL 或 data URL。
       type: "image_url";
       image_url: {
         url: string;
@@ -18,13 +22,18 @@ type VisionContent =
     };
 
 type VisionMessage = {
+  // 视觉模型同样使用 chat message 结构。
   role: ChatRole;
+  // system 可以是字符串；user 需要同时携带图片和文本数组。
   content: string | VisionContent[];
 };
 
 export type FloorPlanAnalysis = {
+  // 户型摘要，例如 3室2厅2卫。
   house_type: string | null;
+  // 模型识别出的面积，无法确认时为 null。
   area: number | null;
+  // 识别出的空间列表，后续效果图按这个列表生成空间图。
   spaces: Array<{
     name: string;
     type: string;
@@ -33,60 +42,83 @@ export type FloorPlanAnalysis = {
     area_ratio?: number | null;
     connections?: string[];
   }>;
+  // 户型动线总结。
   circulation: string | null;
+  // 朝向或采光判断。
   orientation: string | null;
+  // 门的位置和连接关系。
   doors: Array<{
     location: string;
     connects?: string[];
     confidence?: number;
   }>;
+  // 窗的位置、关联空间和朝向。
   windows: Array<{
     location: string;
     related_space?: string | null;
     orientation?: string | null;
     confidence?: number;
   }>;
+  // 墙体疑似结构信息；普通户型图不能确认承重，只能做候选判断。
   walls: Array<{
     location: string;
     type: string;
     confidence?: number;
     note?: string | null;
   }>;
+  // 厨房、卫生间等湿区。
   wet_areas: Array<{
     name: string;
     type: string;
     location?: string | null;
   }>;
+  // 阳台或设备平台等外接空间。
   balconies: Array<{
     name: string;
     location?: string | null;
     related_space?: string | null;
   }>;
+  // 动线诊断结构化结果。
   circulation_analysis: {
     summary: string | null;
     issues: string[];
     score: number | null;
   };
+  // 面积比例和浪费空间诊断结构化结果。
   area_ratio_analysis: {
     summary: string | null;
     potential_waste: string[];
     suggestions: string[];
   };
+  // 结构风险提醒，强调不能仅凭户型图确定承重墙。
   structure_risk_warnings: string[];
+  // 模型自评置信度，0 到 1。
   confidence: number;
+  // 解析限制或不确定性说明。
   warnings: string[];
 };
 
+// 默认文本向量模型，需和知识库 embedding 生成脚本保持一致。
 const DEFAULT_EMBEDDING_MODEL = "text-embedding-v4";
+// PostgreSQL knowledge_chunks.embedding 当前是 vector(1536)，这里必须保持一致。
 const DEFAULT_EMBEDDING_DIMENSION = 1536;
+// AI 装修顾问默认聊天模型。
 const DEFAULT_CHAT_MODEL = "qwen-plus";
+// 户型图解析默认视觉模型。
 const DEFAULT_VISION_MODEL = "qwen-vl-plus";
+// DashScope 默认超时，最终回答可使用更长时间，辅助步骤可单独传短超时。
 const DEFAULT_DASHSCOPE_TIMEOUT_MS = 30000;
+// DashScope embedding 官方接口。
 const DEFAULT_DASHSCOPE_EMBEDDINGS_URL =
   "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding";
+// DashScope OpenAI 兼容 chat/completions 接口。
 const DEFAULT_DASHSCOPE_CHAT_COMPLETIONS_URL =
   "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 
+/**
+ * 读取 DashScope API Key。
+ * 所有 DashScope 调用都走这个入口，缺失时直接抛错，避免请求发出后才失败。
+ */
 function getDashScopeApiKey() {
   const apiKey = process.env.DASHSCOPE_API_KEY;
 
@@ -97,43 +129,79 @@ function getDashScopeApiKey() {
   return apiKey;
 }
 
+/**
+ * 获取文本向量模型名称。
+ * AI 装修顾问用它给用户问题生成 query embedding。
+ */
 function getEmbeddingModel() {
   return process.env.EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL;
 }
 
+/**
+ * 获取 embedding 维度。
+ * 必须和 PostgreSQL pgvector 字段维度一致，目前 knowledge_chunks.embedding 是 vector(1536)。
+ */
 function getEmbeddingDimension() {
   return Number(process.env.EMBEDDING_DIMENSION || DEFAULT_EMBEDDING_DIMENSION);
 }
 
+/**
+ * 获取聊天模型名称。
+ * AI 装修顾问最终回答和追问改写都通过这个模型生成。
+ */
 function getChatModel() {
   return process.env.CHAT_MODEL || DEFAULT_CHAT_MODEL;
 }
 
+/**
+ * 获取视觉模型名称。
+ * 主要用于户型图解析，不属于 AI 装修顾问聊天主链路。
+ */
 function getVisionModel() {
   return process.env.VISION_MODEL || DEFAULT_VISION_MODEL;
 }
 
+/**
+ * 获取 DashScope embedding 接口地址。
+ * 地址放环境变量中，方便生产环境切代理或网关。
+ */
 function getDashScopeEmbeddingsUrl() {
   // URL 放到环境变量里，方便上线后切换阿里官方地址、内网代理或自建网关。
   return process.env.DASHSCOPE_EMBEDDINGS_URL || DEFAULT_DASHSCOPE_EMBEDDINGS_URL;
 }
 
+/**
+ * 获取 DashScope chat completions 接口地址。
+ * 聊天、追问改写和视觉兼容调用都复用这个 OpenAI 兼容接口。
+ */
 function getDashScopeChatCompletionsUrl() {
   // 聊天接口也用环境变量控制，避免以后换模型网关时改代码。
   return process.env.DASHSCOPE_CHAT_COMPLETIONS_URL || DEFAULT_DASHSCOPE_CHAT_COMPLETIONS_URL;
 }
 
+/**
+ * 获取默认 DashScope 请求超时。
+ * 最终回答可以用全局超时，追问改写等辅助步骤可以传入更短 timeout。
+ */
 function getDashScopeTimeoutMs() {
   const timeoutMs = Number(process.env.DASHSCOPE_TIMEOUT_MS || DEFAULT_DASHSCOPE_TIMEOUT_MS);
 
   return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_DASHSCOPE_TIMEOUT_MS;
 }
 
+/**
+ * 创建 AbortSignal 超时控制。
+ * 统一从这里控制 fetch 超时，避免各处手写 setTimeout。
+ */
 function createTimeoutSignal(timeoutMs?: number) {
   // 不同调用场景允许不同超时：追问改写要短，最终回答可以长一些。
   return AbortSignal.timeout(timeoutMs || getDashScopeTimeoutMs());
 }
 
+/**
+ * 解析 DashScope JSON 响应。
+ * 非 2xx 时保留服务端返回体，方便排查 InvalidParameter、限流、鉴权等问题。
+ */
 async function parseDashScopeResponse(response: Response) {
   const payload = await response.json().catch(() => null);
 
@@ -146,6 +214,10 @@ async function parseDashScopeResponse(response: Response) {
   return payload;
 }
 
+/**
+ * 为用户问题生成 query embedding。
+ * 返回值直接传给 PostgreSQL pgvector 检索，不会写回知识库表。
+ */
 export async function createQueryEmbedding(question: string) {
   // 知识库检索先把用户问题转成 query embedding，再去 PostgreSQL/pgvector 做相似度召回。
   const response = await fetch(getDashScopeEmbeddingsUrl(), {
@@ -178,6 +250,10 @@ export async function createQueryEmbedding(question: string) {
   return embedding as number[];
 }
 
+/**
+ * 调用聊天模型生成文本。
+ * 上层负责 prompt 组装；本函数只关心模型调用、超时和返回结构校验。
+ */
 export async function generateChatAnswer(
   messages: ChatMessage[],
   options?: {
@@ -209,6 +285,10 @@ export async function generateChatAnswer(
   return answer;
 }
 
+/**
+ * 从视觉模型返回文本中提取 JSON 对象。
+ * 模型偶尔会包 Markdown code fence，因此需要先截取 JSON 再 parse。
+ */
 function extractJsonObject(content: string) {
   // 视觉模型偶尔会包一层 ```json，这里只截取 JSON 对象，后续再做结构化归一化。
   const trimmed = content.trim();
@@ -224,6 +304,10 @@ function extractJsonObject(content: string) {
   return JSON.parse(jsonText.slice(start, end + 1)) as unknown;
 }
 
+/**
+ * 清洗模型返回的可空文本字段。
+ * 用于把空字符串或 prompt 示例占位文字转换成 null，防止假信息进入数据库。
+ */
 function normalizeNullableText(value: unknown) {
   if (typeof value !== "string") {
     return null;
@@ -239,6 +323,10 @@ function normalizeNullableText(value: unknown) {
   return text;
 }
 
+/**
+ * 将户型图视觉模型返回值归一化成 FloorPlanAnalysis。
+ * 视觉模型输出不稳定，所以所有数组、数字和文本字段都要逐项校验。
+ */
 function normalizeFloorPlanAnalysis(payload: unknown): FloorPlanAnalysis {
   if (!payload || typeof payload !== "object") {
     throw new Error("Floor plan analysis payload is not an object");
@@ -392,6 +480,10 @@ function normalizeFloorPlanAnalysis(payload: unknown): FloorPlanAnalysis {
   };
 }
 
+/**
+ * 调用 DashScope 视觉模型解析户型图。
+ * imageUrl 可以是公网 URL，也可以是后端生成的 data URL；当前本地存储方案使用 data URL。
+ */
 export async function analyzeFloorPlanImage(imageUrl: string) {
   const messages: VisionMessage[] = [
     {

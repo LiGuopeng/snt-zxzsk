@@ -86,8 +86,14 @@ create table if not exists public.chat_request_logs (
   status text not null default 'ok',
   error_message text,
   duration_ms integer,
+  -- 分阶段耗时，单位 ms。用于排查慢请求，例如 embedding/retrieval/answer 哪一步拖慢。
+  stage_timings jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now()
 );
+
+-- 兼容已上线旧库：重复执行 schema.sql 时补齐新增日志字段，不影响已有日志数据。
+alter table public.chat_request_logs
+  add column if not exists stage_timings jsonb not null default '{}'::jsonb;
 
 create index if not exists chat_request_logs_session_id_idx
   on public.chat_request_logs(session_id);

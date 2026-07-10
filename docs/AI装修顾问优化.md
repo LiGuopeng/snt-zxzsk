@@ -1,6 +1,322 @@
 # AI 装修顾问优化文档
 
-## 1. 优化目标
+## 1. 项目链路调用关系
+
+AI 装修顾问当前是一条 RAG 链路：前端负责会话交互，后端负责会话管理、知识库检索、模型调用和日志记录，PostgreSQL 负责保存知识库、会话和审计数据，DashScope 负责 embedding 与回答生成。
+
+### 1.1 总体调用链路
+
+```mermaid
+flowchart TD
+  U["用户"] --> FE["前端聊天界面"]
+  FE --> API["POST /api/chat"]
+  API --> S1["创建或读取 chat_sessions"]
+  API --> S2["写入 user chat_messages"]
+  API --> H["读取最近历史 chat_messages"]
+  H --> RW["追问改写"]
+  RW --> EMB["DashScope Embedding"]
+  EMB --> RET["PostgreSQL pgvector 检索 knowledge_chunks"]
+  RET --> SRC["整理 chunks 和 sources"]
+  SRC --> PROMPT["组装 prompt"]
+  PROMPT --> LLM["DashScope Chat"]
+  LLM --> SAVE["写入 assistant chat_messages"]
+  SAVE --> LOG["写入 chat_request_logs"]
+  LOG --> FE
+```
+
+### 1.2 前端到后端
+
+```text
+前端聊天组件
+-> POST /api/chat
+-> body: { message, sessionId? }
+-> response: { ok, sessionId, answer, sources }
+```
+
+说明：
+
+```text
+message 是用户当前问题。
+sessionId 存在时继续旧会话。
+sessionId 不存在时后端创建新会话。
+answer 是 AI 装修顾问回答。
+sources 是本次回答引用的知识库来源。
+```
+
+### 1.3 后端内部模块调用
+
+```text
+apps/web/src/app/api/chat/route.ts
+-> apps/web/src/lib/ai/intent.ts
+-> apps/web/src/lib/ai/dashscope.ts
+-> apps/web/src/lib/ai/retrieval.ts
+-> apps/web/src/lib/ai/prompt.ts
+-> apps/web/src/lib/ai/chat-logs.ts
+-> apps/web/src/lib/db/postgres.ts
+```
+
+职责关系：
+
+```text
+route.ts：串联整个聊天请求生命周期。
+intent.ts：识别用户问题意图，决定回答策略和强制召回层级。
+dashscope.ts：调用 DashScope embedding、chat 和 vision 能力。
+retrieval.ts：执行 pgvector 检索、关键词兜底、sources 去重。
+prompt.ts：拼装知识库上下文、历史上下文和回答规则。
+chat-logs.ts：记录每次请求的耗时、召回统计和错误。
+postgres.ts：提供 PostgreSQL 连接池。
+```
+
+### 1.4 方法级调用链
+
+下面按一次正常提问的执行顺序说明方法之间的来回调用关系。
+
+```text
+POST /api/chat
+  -> request.json()
+  -> getRequestMessage(body)
+  -> getSessionId(body)
+  -> createPostgresClient()
+  -> createTitleFromMessage(message)
+  -> insert chat_sessions
+  -> insert chat_messages(user)
+  -> rewriteQuestionForRetrieval(message, history)
+       -> buildHistoryText(history)
+       -> generateChatAnswer(messages, { timeoutMs: CHAT_REWRITE_TIMEOUT_MS })
+            -> getDashScopeChatCompletionsUrl()
+            -> getDashScopeApiKey()
+            -> getChatModel()
+            -> createTimeoutSignal(timeoutMs)
+            -> parseDashScopeResponse(response)
+  -> detectIntentProfile(retrievalQuestion)
+  -> createQueryEmbedding(retrievalQuestion)
+       -> getDashScopeEmbeddingsUrl()
+       -> getDashScopeApiKey()
+       -> getEmbeddingModel()
+       -> getEmbeddingDimension()
+       -> createTimeoutSignal()
+       -> parseDashScopeResponse(response)
+  -> retrieveKnowledgeForQuestion(queryEmbedding, intentProfile)
+       -> matchKnowledgeChunks(queryEmbedding)
+            -> createPostgresClient()
+            -> toVectorLiteral(queryEmbedding)
+            -> public.match_knowledge_chunks(...)
+       -> matchKnowledgeChunks(queryEmbedding, { layerFilter })
+       -> matchKeywordKnowledgeChunks(intentProfile) 兜底
+            -> escapeIlikeValue(keyword)
+            -> scoreKeywordChunk(chunk, keywords)
+       -> mergeChunks([baseChunks, forcedGroups])
+  -> prepareRetrievedKnowledge(retrievalResult.chunks)
+       -> isUsefulChunk(chunk)
+       -> dedupeSources(chunks, DEFAULT_SOURCE_COUNT)
+  -> buildChatMessages(message, chunks, history, intentProfile)
+       -> buildKnowledgeContext(chunks)
+            -> formatChunk(chunk, index)
+       -> buildHistoryContext(history)
+       -> buildAnswerPolicyContext(intentProfile)
+  -> generateChatAnswer(messages)
+       -> getDashScopeChatCompletionsUrl()
+       -> getDashScopeApiKey()
+       -> getChatModel()
+       -> createTimeoutSignal()
+       -> parseDashScopeResponse(response)
+  -> insert chat_messages(assistant)
+  -> update chat_sessions
+  -> writeChatRequestLog(...)
+       -> createPostgresClient()
+       -> insert chat_request_logs
+  -> NextResponse.json({ ok, sessionId, answer, sources })
+```
+
+### 1.5 route.ts 内部关键方法职责
+
+```text
+createStageTimer()
+记录本次请求每个阶段耗时，最后写入 chat_request_logs.stage_timings。
+
+getErrorMessage(error)
+把 unknown 异常统一变成字符串，保证日志和接口响应可读。
+
+isTimeoutError(error)
+判断是否为超时类异常，用于返回 AI_TIMEOUT。
+
+createChatErrorResponse(error)
+把底层异常转换成前端可识别的错误结构。
+
+getRequestMessage(body)
+校验并截断用户问题。
+
+getSessionId(body)
+读取前端传入的会话 ID。
+
+createTitleFromMessage(message)
+用第一句话生成默认会话标题。
+
+loadRecentHistory(sessionId)
+读取已有会话最近几条 user/assistant 消息。
+
+buildHistoryText(history)
+把历史消息转换成追问改写 prompt 使用的文本。
+
+rewriteQuestionForRetrieval(question, history)
+把追问改写成完整检索问题；超时则降级为原问题。
+
+POST(request)
+AI 装修顾问主入口，串联会话、检索、prompt、模型回答和日志。
+```
+
+### 1.6 retrieval.ts 内部关键方法职责
+
+```text
+matchKnowledgeChunks(queryEmbedding, options)
+调用 PostgreSQL 函数 public.match_knowledge_chunks 做向量召回。
+
+matchKeywordKnowledgeChunks(intentProfile, options)
+向量召回为空时，用关键词 ilike 兜底检索。
+
+retrieveKnowledgeForQuestion(queryEmbedding, intentProfile)
+检索主入口：普通向量召回 + 意图强制召回 + 关键词兜底。
+
+prepareRetrievedKnowledge(chunks)
+过滤过短 chunk，整理进入 prompt 的 chunks 和返回前端的 sources。
+```
+
+### 1.7 dashscope.ts 内部关键方法职责
+
+```text
+createQueryEmbedding(question)
+调用 DashScope embedding，把用户问题转成 query embedding。
+
+generateChatAnswer(messages, options)
+调用 DashScope chat 模型，生成追问改写或最终回答。
+
+parseDashScopeResponse(response)
+统一解析 DashScope 响应；失败时保留服务端错误 body。
+
+createTimeoutSignal(timeoutMs)
+为 DashScope 请求创建超时控制。
+```
+
+### 1.8 prompt.ts 内部关键方法职责
+
+```text
+buildKnowledgeContext(chunks)
+把知识库 chunks 拼成模型上下文，并控制最大长度。
+
+buildHistoryContext(history)
+把最近对话整理成简短上下文。
+
+buildAnswerPolicyContext(intentProfile)
+根据用户意图生成回答策略。
+
+buildChatMessages(question, chunks, history, intentProfile)
+组装最终传给 DashScope chat 的 system/user messages。
+```
+
+### 1.9 成功路径的数据写入顺序
+
+```text
+1. 如果没有 sessionId：
+   insert chat_sessions
+
+2. 先保存用户问题：
+   insert chat_messages(role = 'user')
+
+3. 检索、组装 prompt、生成回答。
+
+4. 保存 AI 回复：
+   insert chat_messages(role = 'assistant', sources = ...)
+
+5. 更新会话更新时间：
+   update chat_sessions set updated_at = now()
+
+6. 保存请求日志：
+   insert chat_request_logs(status = 'ok', retrieval_stats, stage_timings, sources)
+```
+
+这样设计的原因：
+
+```text
+即使模型回答失败，也能看到用户问了什么。
+即使日志写入失败，也不影响用户拿到回答。
+会话消息和请求日志分开，方便前端恢复会话，也方便后台排查。
+```
+
+### 1.10 失败路径的数据写入顺序
+
+```text
+1. 如果失败发生在用户消息写入之后：
+   chat_messages 中至少保留 user 消息。
+
+2. catch 分支调用 createChatErrorResponse(error)：
+   超时返回 AI_TIMEOUT。
+   普通异常返回 CHAT_FAILED。
+
+3. catch 分支调用 writeChatRequestLog：
+   写入 status = 'error'
+   写入 error_message
+   写入已采集到的 retrieval_question / intent_profile / retrieval_stats
+   写入 stage_timings
+
+4. 返回前端：
+   { ok: false, error, errorCode }
+```
+
+失败路径的核心目标：
+
+```text
+用户能看到可理解错误。
+程序员能从 chat_request_logs.stage_timings 判断慢在哪一步。
+错误不会静默丢失。
+```
+
+### 1.11 数据库调用关系
+
+```mermaid
+flowchart LR
+  API["/api/chat"] --> CS["chat_sessions"]
+  API --> CM["chat_messages"]
+  API --> CRL["chat_request_logs"]
+  API --> KC["knowledge_chunks"]
+  KC --> KD["knowledge_documents"]
+```
+
+表作用：
+
+```text
+chat_sessions：左侧会话列表。
+chat_messages：用户消息、AI 回复和 sources。
+chat_request_logs：请求审计、错误排查和阶段耗时。
+knowledge_documents：知识库原始文档。
+knowledge_chunks：知识库切片和 embedding，是 RAG 检索核心表。
+```
+
+### 1.12 外部服务调用关系
+
+```text
+DashScope Embedding
+用途：把用户问题转成 query embedding。
+调用位置：createQueryEmbedding。
+
+DashScope Chat
+用途：追问改写、最终回答生成。
+调用位置：generateChatAnswer。
+
+PostgreSQL pgvector
+用途：按向量相似度检索 knowledge_chunks。
+调用位置：matchKnowledgeChunks。
+```
+
+### 1.13 当前与效果图模块的边界
+
+```text
+AI 装修顾问：负责知识库问答、咨询判断、解释和建议。
+效果图生成模块：负责户型图上传、户型解析、全屋效果图、空间效果图。
+```
+
+本优化文档只处理 AI 装修顾问链路，不改效果图生成模块。
+
+## 2. 优化目标
 
 AI 装修顾问的目标不是单纯“能回答”，而是做到接近 GPT 类产品的使用体验：
 
@@ -16,9 +332,9 @@ AI 装修顾问的目标不是单纯“能回答”，而是做到接近 GPT 类
 
 本阶段只优化 AI 装修顾问，不改效果图生成模块。
 
-## 2. 当前现状
+## 3. 当前现状
 
-### 2.1 当前功能链路
+### 3.1 当前功能链路
 
 当前 `/api/chat` 的主流程如下：
 
@@ -37,7 +353,7 @@ flowchart TD
   K --> L["返回 answer + sources"]
 ```
 
-### 2.2 当前涉及代码
+### 3.2 当前涉及代码
 
 ```text
 apps/web/src/app/api/chat/route.ts
@@ -59,7 +375,7 @@ apps/web/src/lib/ai/chat-logs.ts
 记录每次请求的检索问题、召回统计、错误和耗时。
 ```
 
-### 2.3 当前数据表
+### 3.3 当前数据表
 
 ```text
 chat_sessions
@@ -78,9 +394,9 @@ knowledge_chunks
 保存知识库切片、embedding、层级、模块、关键词等检索字段。
 ```
 
-## 3. 当前主要问题
+## 4. 当前主要问题
 
-### 3.1 用户体感慢
+### 4.1 用户体感慢
 
 当前接口是一次性 JSON 返回：
 
@@ -91,7 +407,7 @@ knowledge_chunks
 
 这和 GPT 的体验差距最大。GPT 是边生成边展示。
 
-### 3.2 超时错误不够清楚
+### 4.2 超时错误不够清楚
 
 当前用户可能看到：
 
@@ -109,7 +425,7 @@ DashScope chat 慢
 网络慢
 ```
 
-### 3.3 检索和回答耦合较重
+### 4.3 检索和回答耦合较重
 
 当前 `/api/chat` 同时负责：
 
@@ -127,7 +443,7 @@ prompt 拼接
 
 功能能跑，但后续扩展流式输出、工具调用、阶段状态会越来越难维护。
 
-### 3.4 Prompt 上下文可能过长
+### 4.4 Prompt 上下文可能过长
 
 知识库 chunks、历史消息、回答策略都拼进 prompt。上下文越长：
 
@@ -138,7 +454,7 @@ prompt 拼接
 成本也更高
 ```
 
-### 3.5 缺少阶段状态
+### 4.5 缺少阶段状态
 
 当前用户只看到“等待回答”。更好的体验应该展示：
 
@@ -148,9 +464,9 @@ prompt 拼接
 正在生成回答
 ```
 
-## 4. 优化原则
+## 5. 优化原则
 
-### 4.1 以装修顾问核心体验为优先
+### 5.1 以装修顾问核心体验为优先
 
 优化目标不是照搬 GPT 的所有能力，而是优先把装修顾问场景里的核心体验做好。所有能力都要服务于下面这些目标：
 
@@ -165,7 +481,7 @@ prompt 拼接
 
 流式输出、记忆、工具调用和 Agent Router 都是手段，不是目标。只有当它们能提升装修咨询体验时，才进入实施范围。
 
-### 4.2 知识库优先
+### 5.2 知识库优先
 
 AI 装修顾问必须优先基于知识库回答，不直接凭模型常识乱判断。
 
@@ -174,7 +490,7 @@ AI 装修顾问必须优先基于知识库回答，不直接凭模型常识乱�
 知识库不足：说明不能直接判断，并让用户补充信息。
 ```
 
-### 4.3 先优化体验，再做复杂 Agent
+### 5.3 先优化体验，再做复杂 Agent
 
 当前优化顺序：
 
@@ -197,7 +513,7 @@ AI 装修顾问必须优先基于知识库回答，不直接凭模型常识乱�
 Agent Router 复杂度最高，必须等前面链路稳定后再做。
 ```
 
-## 5. 分阶段优化步骤
+## 6. 分阶段优化步骤
 
 ## 第 1 阶段：稳定性和超时优化
 
@@ -226,6 +542,35 @@ Agent Router 复杂度最高，必须等前面链路稳定后再做。
 用户不再只看到笼统 timeout。
 开发者能从日志知道是检索慢还是模型慢。
 简单问题回答速度更快。
+```
+
+已落地：
+
+```text
+1. CHAT_REWRITE_TIMEOUT_MS 控制追问改写超时，默认 8000ms。
+2. 追问改写超时自动降级为原问题，不阻断主回答链路。
+3. 默认向量召回从 8 条降到 6 条。
+4. sources 默认从 6 条降到 4 条。
+5. 强制层级召回从 4 条降到 3 条。
+6. prompt 知识库上下文从 9000 字降到 6000 字。
+7. 历史上下文从 3000 字降到 1800 字。
+8. 超时统一返回 errorCode = AI_TIMEOUT。
+9. 普通失败返回 errorCode = CHAT_FAILED。
+10. chat_request_logs 新增 stage_timings，记录 parse_request、session、history、rewrite_question、embedding、retrieval、prompt、answer、write_log 等阶段耗时。
+```
+
+排查方式：
+
+```sql
+select
+  created_at,
+  status,
+  error_message,
+  duration_ms,
+  stage_timings
+from public.chat_request_logs
+order by created_at desc
+limit 20;
 ```
 
 ## 第 2 阶段：流式输出

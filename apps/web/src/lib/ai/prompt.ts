@@ -2,14 +2,22 @@ import type { ChatMessage } from "@/lib/ai/dashscope";
 import type { IntentProfile } from "@/lib/ai/intent";
 import type { KnowledgeChunk } from "@/lib/ai/retrieval";
 
+// 知识库资料进入 prompt 的最大字符数；控制模型耗时和 token 成本。
 const MAX_CONTEXT_CHARS = 6000;
+// 历史对话进入 prompt 的最大字符数；只保留必要上下文，避免旧对话污染当前回答。
 const MAX_HISTORY_CHARS = 1800;
 
 export type PromptHistoryMessage = {
+  // 只允许用户和助手消息进入最终 prompt，system 消息不作为会话历史恢复。
   role: "user" | "assistant";
+  // 历史消息正文。
   content: string;
 };
 
+/**
+ * 将单个知识库 chunk 格式化为模型可读文本。
+ * 保留来源、层级、模块、章节和风险等级，帮助模型知道资料的上下文和可信边界。
+ */
 function formatChunk(chunk: KnowledgeChunk, index: number) {
   // 把一个知识 chunk 整理成模型容易阅读的格式。
   // 这里保留来源信息，是为了让模型知道这段知识来自哪一层知识库。
@@ -27,6 +35,10 @@ function formatChunk(chunk: KnowledgeChunk, index: number) {
   ].join("\n");
 }
 
+/**
+ * 构建知识库上下文。
+ * 使用 MAX_CONTEXT_CHARS 做硬限制，避免过长资料导致模型响应慢、超时或成本过高。
+ */
 export function buildKnowledgeContext(chunks: KnowledgeChunk[]) {
   // 把多个 chunks 拼成一段 context。
   // MAX_CONTEXT_CHARS 是第一版保护措施，避免一次塞给模型太多内容。
@@ -48,6 +60,10 @@ export function buildKnowledgeContext(chunks: KnowledgeChunk[]) {
   return parts.join("\n\n---\n\n");
 }
 
+/**
+ * 构建最近对话历史上下文。
+ * 历史只保留文字内容，不带 sources，目的是让模型理解追问而不是扩大 prompt。
+ */
 function buildHistoryContext(history: PromptHistoryMessage[]) {
   // 把数据库里最近几轮对话整理成简短上下文。
   // 这里不传 sources，避免 prompt 过长；sources 只用于前端展示和审计。
@@ -70,6 +86,10 @@ function buildHistoryContext(history: PromptHistoryMessage[]) {
   return parts.join("\n");
 }
 
+/**
+ * 根据意图识别结果生成回答策略。
+ * 例如详细问题给步骤，普通问题保持简洁，合同/风险类问题补充对应提醒。
+ */
 function buildAnswerPolicyContext(intentProfile: IntentProfile) {
   return [
     `回答模式：${intentProfile.detailLevel === "detailed" ? "详细步骤" : "简洁回答"}`,
@@ -79,6 +99,10 @@ function buildAnswerPolicyContext(intentProfile: IntentProfile) {
   ].join("\n");
 }
 
+/**
+ * 组装最终传给聊天模型的 messages。
+ * system 负责约束 Agent 边界，user 负责携带问题、历史、策略和知识库资料。
+ */
 export function buildChatMessages(
   question: string,
   chunks: KnowledgeChunk[],

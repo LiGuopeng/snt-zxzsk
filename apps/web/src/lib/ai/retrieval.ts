@@ -2,53 +2,87 @@ import type { IntentProfile } from "@/lib/ai/intent";
 import { createPostgresClient, toVectorLiteral } from "@/lib/db/postgres";
 
 export type KnowledgeChunk = {
+  // knowledge_chunks 主键。
   id: string;
+  // 所属知识文档 ID。
   document_id: string;
+  // chunk 标题，可能来自 markdown 标题。
   title: string | null;
+  // chunk 所在章节。
   section: string | null;
+  // 真正进入 prompt 的知识正文。
   content: string;
+  // 原始 markdown 文件路径，用于前端展示来源和排查知识库。
   source_file: string;
+  // 知识库层级，例如标准、合同、预算、工艺等。
   layer: string | null;
+  // 业务模块，例如水电、泥瓦、合同等。
   module: string | null;
+  // 文档类型，用于辅助模型理解资料性质。
   doc_type: string | null;
+  // 装修阶段，例如签约、施工、验收。
   stage: string | null;
+  // 风险等级，用于回答时判断是否需要提醒用户谨慎。
   risk_level: string | null;
+  // 关键词兜底检索使用的结构化关键词。
   keywords: string[];
+  // 向量召回相似度；关键词兜底结果用 0 表示无向量相似度。
   similarity: number;
 };
 
 export type KnowledgeSource = {
+  // 前端展示的来源文件。
   source_file: string;
+  // 前端展示的章节。
   section: string | null;
+  // 来源所属知识层级。
   layer: string | null;
+  // 来源所属业务模块。
   module: string | null;
+  // 来源相似度，用于调试召回质量。
   similarity: number;
 };
 
 export type RetrievalStats = {
+  // 普通向量召回命中的条数。
   baseVectorCount: number;
+  // 普通召回是否使用了关键词兜底。
   usedKeywordFallback: boolean;
+  // 每个强制召回层级的召回统计。
   forcedLayers: Array<{
     layer: string;
     vectorCount: number;
     usedKeywordFallback: boolean;
     finalCount: number;
   }>;
+  // 合并去重后的总 chunk 数量。
   mergedCount: number;
 };
 
 export type RetrievalResult = {
+  // 最终候选知识片段。
   chunks: KnowledgeChunk[];
+  // 召回统计，写入 chat_request_logs 方便排查。
   stats: RetrievalStats;
 };
 
+// 普通向量召回数量。数量越大资料越全，但 prompt 越长、回答越慢。
 const DEFAULT_MATCH_COUNT = 6;
+// 返回给前端展示的来源数量。
 const DEFAULT_SOURCE_COUNT = 4;
+// 命中特定意图时，每个强制知识层级额外召回的数量。
 const FORCED_MATCH_COUNT = 3;
+// 过滤过短 chunk 的阈值。
 const MIN_CONTENT_CHARS = 30;
+// 向量召回为空时关键词兜底保留的数量。
 const KEYWORD_FALLBACK_COUNT = 8;
+// 每个关键词在数据库里最多扫描返回的候选数量。
 const KEYWORD_QUERY_LIMIT = 30;
 
+/**
+ * 判断一个知识 chunk 是否足够用于回答。
+ * 过滤掉只有标题或内容过短的片段，减少无效上下文占用 prompt。
+ */
 function isUsefulChunk(chunk: KnowledgeChunk) {
   // 第一版先做一个很朴素的质量过滤：
   // 有些 chunk 只有标题，例如“水电增项风险”，这类内容对最终回答帮助不大。
@@ -56,6 +90,10 @@ function isUsefulChunk(chunk: KnowledgeChunk) {
   return chunk.content.trim().length >= MIN_CONTENT_CHARS;
 }
 
+/**
+ * 对 sources 做去重和截断。
+ * 前端只需要展示足够代表性的来源，不需要把同一文件同一章节重复列出。
+ */
 function dedupeSources(chunks: KnowledgeChunk[], limit: number) {
   const sources: KnowledgeSource[] = [];
   const seen = new Set<string>();
@@ -85,6 +123,10 @@ function dedupeSources(chunks: KnowledgeChunk[], limit: number) {
   return sources;
 }
 
+/**
+ * 使用 PostgreSQL pgvector 函数做向量召回。
+ * queryEmbedding 是本次用户问题的向量，layerFilter 用于按知识库层级强制召回。
+ */
 export async function matchKnowledgeChunks(
   queryEmbedding: number[],
   options?: {
@@ -109,10 +151,18 @@ export async function matchKnowledgeChunks(
   return rows as KnowledgeChunk[];
 }
 
+/**
+ * 清理 ILIKE 查询中的通配符。
+ * 关键词兜底只做模糊匹配，不允许用户输入里的 %/_ 扩大匹配范围。
+ */
 function escapeIlikeValue(value: string) {
   return value.replace(/[%_]/g, "").trim();
 }
 
+/**
+ * 给关键词兜底结果打分。
+ * 因为关键词召回没有向量相似度，所以用文件名、标题、章节、模块、正文命中位置做可解释排序。
+ */
 function scoreKeywordChunk(chunk: KnowledgeChunk, keywords: string[]) {
   // 关键词兜底没有向量相似度，所以用可解释的权重排序。
   // 文件名、标题、章节命中更可信；正文命中只作为弱信号。
@@ -134,6 +184,10 @@ function scoreKeywordChunk(chunk: KnowledgeChunk, keywords: string[]) {
   return score;
 }
 
+/**
+ * 当向量召回为空时，用关键词在 knowledge_chunks 中做兜底检索。
+ * 这是服务可用性保护：embedding 缺失或向量索引异常时，AI 顾问仍能尽量回答。
+ */
 async function matchKeywordKnowledgeChunks(
   intentProfile: IntentProfile,
   options?: {
@@ -193,6 +247,10 @@ async function matchKeywordKnowledgeChunks(
     .slice(0, options?.limit || KEYWORD_FALLBACK_COUNT);
 }
 
+/**
+ * 合并多组召回结果并按 chunk id 去重。
+ * 用于把普通向量召回和意图强制召回合并成最终候选上下文。
+ */
 function mergeChunks(groups: KnowledgeChunk[][]) {
   const merged: KnowledgeChunk[] = [];
   const seen = new Set<string>();
@@ -211,6 +269,10 @@ function mergeChunks(groups: KnowledgeChunk[][]) {
   return merged;
 }
 
+/**
+ * AI 装修顾问的主检索入口。
+ * 先做普通向量召回，再根据意图强制召回关键知识层级，最后必要时关键词兜底。
+ */
 export async function retrieveKnowledgeForQuestion(
   queryEmbedding: number[],
   intentProfile: IntentProfile,
@@ -269,6 +331,10 @@ export async function retrieveKnowledgeForQuestion(
   };
 }
 
+/**
+ * 将召回结果整理成最终可进入 prompt 的 chunks 和可展示的 sources。
+ * rawChunks 保留原始召回结果，便于后续调试召回质量。
+ */
 export function prepareRetrievedKnowledge(chunks: KnowledgeChunk[]) {
   // rawChunks：保留数据库原始召回结果，方便后续调试。
   // chunks：过滤后的结果，准备用来组装 prompt。
