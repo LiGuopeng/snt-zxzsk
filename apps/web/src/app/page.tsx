@@ -78,6 +78,13 @@ type ChatStreamTokenPayload = {
   token?: string;
 };
 
+type ChatStreamStagePayload = {
+  // 后端阶段标识，例如 retrieval、answer、evidence。
+  stage?: string;
+  // 给用户展示的阶段文案。
+  label?: string;
+};
+
 // 空态页展示的示例问题，帮助用户理解 AI 装修顾问适合问什么。
 const EXAMPLE_QUESTIONS = [
   "水电增项 8000 是不是被坑了？",
@@ -172,6 +179,8 @@ export default function Home() {
   const [error, setError] = useState("");
   // 正在生成回答的会话 ID 列表，支持不同会话并行生成。
   const [loadingConversationIds, setLoadingConversationIds] = useState<string[]>([]);
+  // 每个正在生成的会话对应的阶段文案，用于展示“正在理解问题/检索知识库/生成回答”等状态。
+  const [conversationStageLabels, setConversationStageLabels] = useState<Record<string, string>>({});
   // 保存最新 activeConversationId，避免流式请求闭包里拿到旧状态。
   const activeConversationIdRef = useRef<string | null>(null);
 
@@ -179,6 +188,10 @@ export default function Home() {
   const activeConversationLoading = activeConversationId
     ? loadingConversationIds.includes(activeConversationId)
     : loadingConversationIds.includes(NEW_CHAT_ID);
+  // 当前聊天窗口的阶段文案。没有服务端阶段事件时，使用兜底文案。
+  const activeConversationStageLabel = activeConversationId
+    ? conversationStageLabels[activeConversationId]
+    : conversationStageLabels[NEW_CHAT_ID];
   // 是否允许提交问题。
   const canSubmit = useMemo(
     () => input.trim().length > 0 && !activeConversationLoading,
@@ -265,6 +278,8 @@ export default function Home() {
       requestActiveConversationId === NEW_CHAT_ID ? null : requestActiveConversationId;
     // loading key 用真实 sessionId 或 NEW_CHAT_ID，支持不同会话并行生成。
     const requestConversationKey = requestSessionId || NEW_CHAT_ID;
+    // 后端可能为新对话创建真实 sessionId，请求结束时用它清理阶段文案。
+    let responseSessionId: string | null = null;
 
     if (!question || loadingConversationIds.includes(requestConversationKey)) {
       return;
@@ -295,6 +310,10 @@ export default function Home() {
     setLoadingConversationIds((current) =>
       current.includes(requestConversationKey) ? current : [...current, requestConversationKey],
     );
+    setConversationStageLabels((current) => ({
+      ...current,
+      [requestConversationKey]: "正在准备会话",
+    }));
 
     try {
       const response = await fetch("/api/chat", {
@@ -330,9 +349,34 @@ export default function Home() {
 
         const parsed = parseServerSentEvent(block);
 
+        if (parsed.event === "stage") {
+          const payload = parsed.data as ChatStreamStagePayload | null;
+          const label = payload?.label?.trim();
+
+          if (!label) {
+            return;
+          }
+
+          setConversationStageLabels((current) => ({
+            ...current,
+            [requestConversationKey]: label,
+          }));
+          return;
+        }
+
         if (parsed.event === "session") {
           // session 事件只说明后端已经准备好会话。
           // 新会话的 activeConversationId 等 done 事件再切换，避免流式 token 更新被会话 ID 变化挡住。
+          const payload = parsed.data as { sessionId?: string } | null;
+
+          if (!requestSessionId && payload?.sessionId) {
+            const createdSessionId = payload.sessionId;
+            responseSessionId = createdSessionId;
+            setConversationStageLabels((current) => ({
+              ...current,
+              [createdSessionId]: current[requestConversationKey] || "正在准备会话",
+            }));
+          }
           return;
         }
 
@@ -419,6 +463,16 @@ export default function Home() {
       setLoadingConversationIds((current) =>
         current.filter((conversationId) => conversationId !== requestConversationKey),
       );
+      setConversationStageLabels((current) => {
+        const next = { ...current };
+
+        delete next[requestConversationKey];
+        if (responseSessionId) {
+          delete next[responseSessionId];
+        }
+
+        return next;
+      });
     }
   }
 
@@ -575,7 +629,7 @@ export default function Home() {
                     <span className="min-w-0 flex-1 truncate">{conversation.title}</span>
                     {loadingConversationIds.includes(conversation.id) ? (
                       <span className="shrink-0 rounded-full bg-white/12 px-2 py-0.5 text-xs text-white/72">
-                        生成中
+                        {conversationStageLabels[conversation.id] || "生成中"}
                       </span>
                     ) : (
                       <span className="shrink-0 text-xs text-white/45">
@@ -620,7 +674,7 @@ export default function Home() {
           </div>
         </aside>
 
-        <section className="flex min-w-0 flex-1 flex-col bg-[#f4f7fb]">
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-[#f4f7fb]">
           <header className="flex h-[72px] shrink-0 items-center justify-between border-b border-[#dbe5f3] bg-white px-4 md:px-7">
             <div>
               <h1 className="text-2xl font-semibold tracking-normal text-[#111827]">
@@ -647,6 +701,7 @@ export default function Home() {
           ) : (
             <ChatWorkspace
               activeConversationLoading={activeConversationLoading}
+              activeConversationStageLabel={activeConversationStageLabel}
               canSubmit={canSubmit}
               error={error}
               exampleQuestions={EXAMPLE_QUESTIONS}

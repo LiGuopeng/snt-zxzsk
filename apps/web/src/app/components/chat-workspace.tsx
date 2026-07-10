@@ -1,4 +1,4 @@
-import { FormEvent } from "react";
+import { FormEvent, useEffect, useRef } from "react";
 
 type Source = {
   // used 表示回答后确认采用；retrieved 表示二次筛选失败后的检索兜底依据。
@@ -33,6 +33,8 @@ export type ChatMessage = {
 type ChatWorkspaceProps = {
   // 当前会话是否正在生成回答，用于控制 loading、按钮禁用和底部提示。
   activeConversationLoading: boolean;
+  // 当前会话的生成阶段文案，例如正在检索知识库、正在生成回答。
+  activeConversationStageLabel?: string;
   // 是否允许提交；通常要求有输入内容且当前会话不在生成中。
   canSubmit: boolean;
   // 页面级错误信息，例如接口失败、AI 超时等。
@@ -56,6 +58,7 @@ type ChatWorkspaceProps = {
  */
 export function ChatWorkspace({
   activeConversationLoading,
+  activeConversationStageLabel,
   canSubmit,
   error,
   exampleQuestions,
@@ -66,6 +69,23 @@ export function ChatWorkspace({
 }: ChatWorkspaceProps) {
   // 是否已经有消息。没有消息时展示产品空态和示例问题；有消息时展示聊天列表。
   const hasMessages = messages.length > 0;
+  // 聊天消息滚动容器。新消息或流式 token 到来时，需要控制这个容器滚动到底部。
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // 消息列表底部锚点。scrollIntoView 比手算 scrollTop 更稳，适配 sources 展开后的高度变化。
+  const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    // 消息新增、AI 流式输出、阶段文案变化时，保持视图跟随最新内容。
+    // requestAnimationFrame 等浏览器完成本轮布局后再滚动，避免内容高度还没更新就计算位置。
+    const frameId = window.requestAnimationFrame(() => {
+      bottomAnchorRef.current?.scrollIntoView({
+        block: "end",
+        behavior: "smooth",
+      });
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [activeConversationStageLabel, messages]);
 
   /**
    * 根据 sources 的来源模式生成前端展示文案。
@@ -90,7 +110,7 @@ export function ChatWorkspace({
 
   return (
     <>
-      <div className="flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto" ref={scrollContainerRef}>
         {/* 空态：用户还没有开始咨询时，直接给出可点击的装修问题示例。 */}
         {!hasMessages ? (
           <section className="mx-auto flex min-h-full w-full max-w-6xl flex-col justify-center px-6 py-10">
@@ -103,7 +123,7 @@ export function ChatWorkspace({
                 今天想解决哪个装修问题？
               </h2>
               <p className="mt-5 max-w-3xl text-[15px] leading-8 text-[#405176]">
-                直接描述房子、阶段、报价、合同或现场现象。我会先检索你的装修知识库，再给出简洁建议和参考来源。
+                直接描述房子、阶段、报价、合同或现场现象。我会先检索你的装修知识库，再给出简洁建议和回答依据。
               </p>
 
               <div className="mt-8 grid w-full gap-3 sm:grid-cols-2">
@@ -203,10 +223,11 @@ export function ChatWorkspace({
               <article className="py-5">
                 <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-2 text-sm text-[#647399] shadow-sm">
                   <span className="size-2 animate-pulse rounded-full bg-[#0969ff]" />
-                  正在检索知识库并生成回答...
+                  {activeConversationStageLabel || "正在检索知识库并生成回答..."}
                 </div>
               </article>
             ) : null}
+            <div ref={bottomAnchorRef} />
           </section>
         )}
       </div>

@@ -1307,6 +1307,108 @@ done: 回答完成
 error: 回答失败
 ```
 
+### 3.1 本阶段已完成改造
+
+本阶段主要补齐前端对 `stage` 事件的消费。后端在第 2 阶段流式接口中已经输出 stage 事件，本阶段让用户能在页面上看到真实阶段。
+
+链路：
+
+```text
+route.ts writeEvent("stage", { stage, label })
+-> page.tsx parseServerSentEvent()
+-> handleEvent("stage")
+-> conversationStageLabels[conversationId] = label
+-> ChatWorkspace 展示 activeConversationStageLabel
+-> 左侧会话生成中标签展示当前阶段
+```
+
+### 3.2 修改文件
+
+```text
+apps/web/src/app/page.tsx
+```
+
+新增状态：
+
+```text
+conversationStageLabels
+```
+
+作用：
+
+```text
+用会话 ID 记录当前生成阶段。
+同一个页面中如果多个会话同时生成，不会互相覆盖阶段文案。
+```
+
+新增类型：
+
+```text
+ChatStreamStagePayload
+```
+
+作用：
+
+```text
+约束后端 stage 事件的数据结构。
+stage 是机器可读阶段名，label 是用户可读文案。
+```
+
+新增处理：
+
+```text
+handleEvent("stage")
+```
+
+作用：
+
+```text
+收到后端阶段事件后，把 label 写入 conversationStageLabels。
+当前聊天窗口和左侧会话列表都读取这份状态。
+```
+
+```text
+apps/web/src/app/components/chat-workspace.tsx
+```
+
+新增入参：
+
+```text
+activeConversationStageLabel
+```
+
+作用：
+
+```text
+把当前会话阶段显示在聊天窗口底部 loading 区域。
+没有阶段文案时，使用“正在检索知识库并生成回答...”兜底。
+```
+
+### 3.3 当前可展示阶段
+
+后端当前会发出这些用户可见阶段：
+
+```text
+正在准备会话
+正在理解问题
+正在生成检索向量
+正在检索知识库
+正在整理回答依据
+正在生成回答
+正在确认回答依据
+```
+
+### 3.4 意义
+
+```text
+优化前：
+用户只看到一个统一 loading，不知道卡在哪一步。
+
+优化后：
+用户可以看到当前阶段，能区分是理解问题、检索知识库、生成回答，还是确认回答依据。
+这能降低“接口死循环/页面卡死”的感受。
+```
+
 ## 第 4 阶段：短期记忆优化
 
 目标：
