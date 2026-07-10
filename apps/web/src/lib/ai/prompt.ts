@@ -14,6 +14,11 @@ export type PromptHistoryMessage = {
   content: string;
 };
 
+export type ChatPromptContext = {
+  // 会话摘要来自 chat_sessions.summary，用来承接更早的房屋背景、预算、阶段和已讨论问题。
+  sessionSummary?: string | null;
+};
+
 /**
  * 将单个知识库 chunk 格式化为模型可读文本。
  * 保留来源、层级、模块、章节和风险等级，帮助模型知道资料的上下文和可信边界。
@@ -108,10 +113,12 @@ export function buildChatMessages(
   chunks: KnowledgeChunk[],
   history: PromptHistoryMessage[] = [],
   intentProfile: IntentProfile,
+  promptContext: ChatPromptContext = {},
 ): ChatMessage[] {
   const context = buildKnowledgeContext(chunks);
   const historyContext = buildHistoryContext(history);
   const answerPolicyContext = buildAnswerPolicyContext(intentProfile);
+  const sessionSummary = promptContext.sessionSummary?.trim();
 
   // system message：写死 Agent 的行为边界。
   // 重点是让模型基于知识库回答，而不是凭空发挥。
@@ -132,6 +139,9 @@ export function buildChatMessages(
   // 后续如果做多轮对话，可以在这里追加历史消息摘要。
   const userPrompt = [
     "请根据下面的历史对话和知识库资料回答用户问题。",
+    "",
+    "【会话摘要】",
+    sessionSummary || "暂无会话摘要。",
     "",
     "【最近对话历史】",
     historyContext || "暂无历史对话。",

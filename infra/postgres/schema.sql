@@ -55,9 +55,18 @@ create table if not exists public.chat_sessions (
   id uuid primary key default gen_random_uuid(),
   user_id uuid,
   title text,
+  -- 会话摘要：长对话压缩后的关键背景，供后续追问使用，避免只依赖最近几条消息。
+  summary text,
+  -- 会话结构化记忆：预留给房屋面积、装修阶段、预算、风格偏好等字段。
+  memory jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- 兼容已上线旧库：重复执行 schema.sql 时补齐短期记忆字段，不影响已有会话。
+alter table public.chat_sessions
+  add column if not exists summary text,
+  add column if not exists memory jsonb not null default '{}'::jsonb;
 
 create table if not exists public.chat_messages (
   id uuid primary key default gen_random_uuid(),

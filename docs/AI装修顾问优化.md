@@ -1417,21 +1417,541 @@ activeConversationStageLabel
 让多轮追问更自然。
 ```
 
-当前只取最近 6 条消息。后续可以优化为：
+原问题：
 
 ```text
-1. 最近消息保留。
-2. 超长历史做摘要。
-3. 会话摘要保存到 chat_sessions 或独立表。
-4. 追问改写优先使用摘要 + 最近几条消息。
+系统只取最近 6 条消息。
+对话变长后，前面提到的房屋面积、预算、装修阶段、已讨论问题容易丢失。
 ```
 
-新增字段建议：
+### 4.1 本阶段已完成改造
+
+第一版短期记忆采用“会话摘要 + 最近消息”的方式。
+
+链路：
+
+```text
+已有会话继续提问
+-> loadRecentHistory(sessionId)
+-> loadSessionMemoryContext(sessionId)
+-> buildChatMessages(question, chunks, history, intentProfile, { sessionSummary })
+-> 模型回答时同时看到会话摘要和最近对话
+-> 写入 assistant 消息
+-> loadHistoryForMemory(sessionId)
+-> refreshSessionSummary()
+-> 更新 chat_sessions.summary
+```
+
+### 4.2 数据库字段
+
+文件：
+
+```text
+infra/postgres/schema.sql
+```
+
+字段：
 
 ```sql
 alter table public.chat_sessions
 add column if not exists summary text,
 add column if not exists memory jsonb not null default '{}'::jsonb;
+```
+
+字段含义：
+
+```text
+summary：
+长对话压缩后的自然语言摘要。
+用于记录用户房屋背景、装修阶段、预算、已讨论问题和关键建议。
+
+memory：
+结构化记忆预留字段。
+后续可保存 house_area、budget、stage、style 等稳定用户画像。
+```
+
+### 4.2.1 第一版具体执行步骤和备注
+
+#### 步骤 1：先让数据库具备保存会话记忆的能力
+
+```text
+对应文件：
+infra/postgres/schema.sql
+
+涉及表：
+public.chat_sessions
+
+执行内容：
+给 chat_sessions 增加 summary 和 memory。
+```
+
+实际 SQL：
+
+```sql
+alter table public.chat_sessions
+  add column if not exists summary text,
+  add column if not exists memory jsonb not null default '{}'::jsonb;
+```
+
+字段职责：
+
+```text
+summary：
+自然语言摘要。
+用于保存这个会话里较早出现、但后续追问仍然需要的背景。
+
+memory：
+结构化 JSON。
+本阶段先预留，不强行抽取字段。
+后续可以升级为：
+{
+  "house_area": 98,
+  "renovation_stage": "水电阶段",
+  "budget": "12万",
+  "style": "奶油风"
+}
+```
+
+备注：
+
+```text
+为什么不单独建一张 memory 表？
+第一版只做会话级短期记忆，summary 和 session 强绑定，放在 chat_sessions 最简单。
+后续如果要做跨会话用户画像，再拆 user_project_profiles 或 chat_session_memories。
+
+为什么要 add column if not exists？
+线上数据库可能已经有 chat_sessions。
+这样重复执行 schema.sql 不会报错，也不会清空旧聊天记录。
+```
+
+#### 步骤 2：进入 /api/chat 后先确定当前会话
+
+```text
+对应文件：
+apps/web/src/app/api/chat/route.ts
+
+入口方法：
+POST(request)
+
+输入：
+request body 里的 message 和 sessionId。
+
+输出：
+activeSessionId。
+```
+
+执行逻辑：
+
+```text
+1. 如果前端传了 sessionId：
+   说明用户是在继续一个老会话。
+   后端使用这个 sessionId 读取历史和记忆。
+
+2. 如果前端没有传 sessionId：
+   说明用户发起的是新会话。
+   后端先创建 chat_sessions，再得到新的 activeSessionId。
+```
+
+备注：
+
+```text
+短期记忆只对“已有会话继续提问”有明显价值。
+新会话没有历史背景，所以 summary 默认为 null。
+```
+
+#### 步骤 3：老会话并行读取“最近消息”和“会话摘要”
+
+```text
+对应文件：
+apps/web/src/app/api/chat/route.ts
+
+对应方法：
+loadRecentHistory()
+loadSessionMemoryContext()
+```
+
+读取最近消息：
+
+```sql
+select role, content
+from public.chat_messages
+where session_id = 当前 sessionId
+  and role in ('user', 'assistant')
+order by created_at desc
+limit 6;
+```
+
+读取会话摘要：
+
+```sql
+select summary, memory
+from public.chat_sessions
+where id = 当前 sessionId
+limit 1;
+```
+
+代码链路：
+
+```text
+stageTimer.track("history", async () => {
+  Promise.all([
+    loadRecentHistory(existingSessionId),
+    loadSessionMemoryContext(existingSessionId)
+  ])
+})
+```
+
+输出结果：
+
+```text
+history：
+最近 6 条 user / assistant 消息。
+
+sessionMemoryContext.summary：
+更早对话压缩后的摘要。
+
+sessionMemoryContext.memory：
+预留结构化记忆。
+```
+
+备注：
+
+```text
+为什么要并行读取？
+最近消息和会话摘要互不依赖，可以 Promise.all 并行，减少接口等待时间。
+
+为什么还保留最近 6 条？
+summary 是压缩结果，适合保存背景。
+最近消息保留原文，适合处理用户刚刚的追问和上下句关系。
+```
+
+#### 步骤 4：追问改写仍然使用最近消息
+
+```text
+对应文件：
+apps/web/src/app/api/chat/route.ts
+
+对应方法：
+rewriteQuestionForRetrieval()
+```
+
+执行内容：
+
+```text
+用最近 history 把用户追问改写成完整检索问题。
+
+例如：
+上一轮用户说：水电增项 8000 合理吗？
+这一轮用户说：那我怎么跟工长说？
+
+改写后应该接近：
+用户面对水电增项 8000，应该如何和工长沟通并核对报价？
+```
+
+备注：
+
+```text
+这里暂时没有把 summary 放进追问改写。
+原因是第一版先控制变量，避免摘要影响检索问题。
+后续如果发现长对话追问改写仍然不稳，可以升级为：summary + 最近消息一起参与 rewrite。
+```
+
+#### 步骤 5：知识库检索仍然基于 retrievalQuestion
+
+```text
+对应文件：
+apps/web/src/app/api/chat/route.ts
+
+对应方法：
+detectIntentProfile()
+createQueryEmbedding()
+retrieveKnowledgeForQuestion()
+prepareRetrievedKnowledge()
+```
+
+执行链路：
+
+```text
+retrievalQuestion
+-> detectIntentProfile(retrievalQuestion)
+-> createQueryEmbedding(retrievalQuestion)
+-> retrieveKnowledgeForQuestion(queryEmbedding, intentProfile)
+-> prepareRetrievedKnowledge(retrievalResult.chunks)
+```
+
+备注：
+
+```text
+短期记忆不替代知识库检索。
+记忆解决“用户上下文”。
+知识库解决“装修专业依据”。
+
+例如：
+summary 记住用户是 98 平、水电阶段。
+knowledge_chunks 提供水电报价、合同增项、证据留存等专业资料。
+```
+
+#### 步骤 6：组装 prompt 时加入【会话摘要】
+
+```text
+对应文件：
+apps/web/src/lib/ai/prompt.ts
+
+对应方法：
+buildChatMessages()
+```
+
+输入：
+
+```text
+question：用户当前问题。
+chunks：本轮知识库召回结果。
+history：最近 6 条消息。
+intentProfile：意图识别结果。
+promptContext.sessionSummary：会话摘要。
+```
+
+Prompt 结构：
+
+```text
+【会话摘要】
+保存更早对话里的房屋背景、预算、装修阶段、已讨论问题。
+
+【最近对话历史】
+保存最近几轮上下句。
+
+【用户问题】
+用户当前输入。
+
+【本次回答策略】
+根据 intentProfile 得出的回答要求。
+
+【知识库资料】
+本轮 RAG 检索到的装修知识。
+```
+
+备注：
+
+```text
+为什么 summary 放在最近对话前？
+summary 是整体背景，先给模型建立上下文。
+最近对话更具体，放在后面让模型接住当前追问。
+
+为什么 summary 不是 sources？
+summary 是用户会话上下文，不是装修专业依据。
+sources 仍然只来自 knowledge_chunks。
+```
+
+#### 步骤 7：AI 回答、依据确认、消息入库保持原链路
+
+```text
+对应文件：
+apps/web/src/app/api/chat/route.ts
+
+执行内容：
+buildChatMessages()
+-> generateChatAnswerStream()
+-> selectAnswerSources()
+-> insert into chat_messages(role = 'assistant', content, sources)
+```
+
+备注：
+
+```text
+这一段没有因为短期记忆而改变用户体验。
+用户仍然看到流式输出。
+回答依据仍然走 used / retrieved 的逻辑。
+```
+
+#### 步骤 8：回答保存后刷新会话摘要
+
+```text
+对应文件：
+apps/web/src/app/api/chat/route.ts
+
+对应方法：
+loadHistoryForMemory()
+refreshSessionSummary()
+```
+
+触发位置：
+
+```text
+assistant 消息写入 chat_messages 之后。
+update_session 和 write_log 之前。
+```
+
+执行链路：
+
+```text
+insert assistant message
+-> stageTimer.track("memory")
+-> loadHistoryForMemory(activeSessionId)
+-> refreshSessionSummary(activeSessionId, oldSummary, historyForMemory)
+-> update chat_sessions.summary
+```
+
+读取摘要材料：
+
+```text
+loadHistoryForMemory()
+读取最近 14 条 user / assistant 消息。
+```
+
+刷新规则：
+
+```text
+如果最近消息少于 MEMORY_REFRESH_MIN_MESSAGES，暂时不刷新摘要。
+当前阈值：8 条。
+```
+
+写入位置：
+
+```sql
+update public.chat_sessions
+set summary = 新摘要,
+    updated_at = now()
+where id = 当前 sessionId;
+```
+
+备注：
+
+```text
+为什么回答保存后再刷新？
+因为摘要要包含本轮用户问题和 AI 回复。
+如果在回答前刷新，就缺少本轮结论。
+
+为什么摘要刷新失败不抛错？
+摘要是增强能力，不是主回答能力。
+失败不能影响用户拿到本次回答。
+```
+
+#### 步骤 9：下一轮追问复用新摘要
+
+```text
+下一轮用户继续同一个 session 提问时：
+loadSessionMemoryContext()
+会读取上一步写入的 summary。
+```
+
+闭环：
+
+```text
+第 N 轮回答后刷新 summary
+-> 第 N+1 轮提问读取 summary
+-> buildChatMessages() 放入【会话摘要】
+-> 模型回答更能接住早期背景
+```
+
+备注：
+
+```text
+这就是短期记忆第一版的闭环。
+它不是永久用户画像，也不是跨会话记忆。
+它只服务当前 chat_session 内的连续咨询。
+```
+
+#### 步骤 10：当前第一版边界
+
+```text
+已经做到：
+1. 老会话读取 summary。
+2. prompt 使用 summary。
+3. 回答后刷新 summary。
+4. 摘要刷新失败不影响主回答。
+
+暂时没做：
+1. 不做跨会话用户画像。
+2. 不把 memory JSON 自动结构化。
+3. 不让 summary 参与追问改写。
+4. 不在前端展示 summary。
+
+原因：
+第一版先解决“长对话上下文丢失”。
+结构化用户画像和跨会话记忆放到第 5 阶段。
+```
+
+### 4.3 后端方法
+
+文件：
+
+```text
+apps/web/src/app/api/chat/route.ts
+```
+
+新增方法：
+
+```text
+loadSessionMemoryContext()
+```
+
+作用：
+
+```text
+从 chat_sessions 读取 summary 和 memory。
+summary 进入 prompt，memory 先预留。
+```
+
+新增方法：
+
+```text
+loadHistoryForMemory()
+```
+
+作用：
+
+```text
+读取最近较多消息，用于刷新会话摘要。
+它不直接进入最终回答 prompt，避免上下文过长。
+```
+
+新增方法：
+
+```text
+refreshSessionSummary()
+```
+
+作用：
+
+```text
+回答完成后，用已有摘要 + 最近对话生成新的会话摘要。
+摘要刷新失败不会影响本次回答返回。
+```
+
+### 4.4 Prompt 改造
+
+文件：
+
+```text
+apps/web/src/lib/ai/prompt.ts
+```
+
+改造：
+
+```text
+buildChatMessages() 新增 promptContext.sessionSummary。
+最终 prompt 里新增【会话摘要】区域。
+```
+
+回答时上下文结构：
+
+```text
+【会话摘要】
+记录更早的房屋背景、预算、装修阶段、已讨论问题。
+
+【最近对话历史】
+记录最近几轮具体追问。
+
+【知识库资料】
+记录本轮 RAG 检索到的资料。
+```
+
+### 4.5 失败兜底
+
+```text
+1. 没有 summary：按原逻辑使用最近消息回答。
+2. 摘要刷新失败：不影响本次回答、sources 入库和日志写入。
+3. 对话太短：不刷新摘要，避免无意义摘要。
 ```
 
 ## 第 5 阶段：装修项目记忆

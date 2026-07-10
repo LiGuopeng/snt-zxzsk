@@ -30,6 +30,7 @@ type ChatStreamStage =
   | "prompt"
   | "answer"
   | "evidence"
+  | "memory"
   | "write_assistant_message"
   | "update_session"
   | "write_log";
@@ -38,9 +39,19 @@ const MAX_MESSAGE_CHARS = 1000;
 const HISTORY_LIMIT = 6;
 const QUESTION_REWRITE_TIMEOUT_MS = Number(process.env.CHAT_REWRITE_TIMEOUT_MS || 8000);
 const ANSWER_EVIDENCE_TIMEOUT_MS = Number(process.env.CHAT_EVIDENCE_TIMEOUT_MS || 10000);
+const CHAT_MEMORY_TIMEOUT_MS = Number(process.env.CHAT_MEMORY_TIMEOUT_MS || 10000);
 const SIMPLE_EVIDENCE_SOURCE_LIMIT = 2;
 const NORMAL_EVIDENCE_SOURCE_LIMIT = 3;
 const COMPLEX_EVIDENCE_SOURCE_LIMIT = 4;
+const MEMORY_HISTORY_LIMIT = 14;
+const MEMORY_REFRESH_MIN_MESSAGES = 8;
+
+type SessionMemoryContext = {
+  // chat_sessions.summary，长对话压缩后的关键背景。
+  summary: string | null;
+  // chat_sessions.memory，预留结构化记忆字段。
+  memory: Record<string, unknown>;
+};
 
 /**
  * 创建流式接口使用的阶段计时器。
@@ -156,6 +167,25 @@ async function loadRecentHistory(sessionId: string) {
 }
 
 /**
+ * 加载当前会话的短期记忆。
+ * summary 负责承接更早上下文，recent history 负责承接最近追问。
+ */
+async function loadSessionMemoryContext(sessionId: string): Promise<SessionMemoryContext> {
+  const sql = createPostgresClient();
+  const [session] = await sql<Array<{ summary: string | null; memory: Record<string, unknown> | null }>>`
+    select summary, memory
+    from public.chat_sessions
+    where id = ${sessionId}
+    limit 1
+  `;
+
+  return {
+    summary: session?.summary || null,
+    memory: session?.memory || {},
+  };
+}
+
+/**
  * 把历史消息整理成追问改写模型需要的文本。
  * 这里只服务 retrieval question rewrite，不直接展示给用户。
  */
@@ -163,6 +193,89 @@ function buildHistoryText(history: PromptHistoryMessage[]) {
   return history
     .map((item) => `${item.role === "user" ? "用户" : "genengi"}：${item.content.trim()}`)
     .join("\n");
+}
+
+/**
+ * 读取较长历史，用于回答完成后刷新会话摘要。
+ * 这一步不进入主回答 prompt，避免每次回答都塞入过多历史。
+ */
+async function loadHistoryForMemory(sessionId: string) {
+  const sql = createPostgresClient();
+  const rows = await sql<PromptHistoryMessage[]>`
+    select role, content
+    from (
+      select role, content, created_at
+      from public.chat_messages
+      where session_id = ${sessionId}
+        and role in ('user', 'assistant')
+      order by created_at desc
+      limit ${MEMORY_HISTORY_LIMIT}
+    ) recent_messages
+    order by created_at asc
+  `;
+
+  return rows.map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
+}
+
+/**
+ * 生成下一轮可复用的会话摘要。
+ * 摘要只记录事实背景和已讨论结论，不记录寒暄，避免污染后续回答。
+ */
+async function refreshSessionSummary(
+  sessionId: string,
+  previousSummary: string | null,
+  historyForMemory: PromptHistoryMessage[],
+) {
+  if (historyForMemory.length < MEMORY_REFRESH_MIN_MESSAGES) {
+    return previousSummary;
+  }
+
+  const nextSummary = await generateChatAnswer(
+    [
+      {
+        role: "system",
+        content: [
+          "你负责为装修咨询会话生成短期记忆摘要。",
+          "只保留后续追问需要的事实：房屋信息、装修阶段、预算、合同/报价/施工问题、用户偏好、已给过的重要建议。",
+          "不要编造用户没有说过的信息。",
+          "不要写成回答，不要给新建议。",
+          "控制在 300 字以内。",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          "【已有摘要】",
+          previousSummary || "暂无。",
+          "",
+          "【最近对话】",
+          buildHistoryText(historyForMemory),
+          "",
+          "请输出更新后的会话摘要：",
+        ].join("\n"),
+      },
+    ],
+    {
+      timeoutMs: CHAT_MEMORY_TIMEOUT_MS,
+    },
+  );
+  const cleanedSummary = nextSummary.trim().slice(0, 1000);
+
+  if (!cleanedSummary) {
+    return previousSummary;
+  }
+
+  const sql = createPostgresClient();
+  await sql`
+    update public.chat_sessions
+    set summary = ${cleanedSummary}, updated_at = now()
+    where id = ${sessionId}
+  `;
+
+  return cleanedSummary;
 }
 
 /**
@@ -457,6 +570,10 @@ export async function POST(request: Request) {
           const sql = createPostgresClient();
           let activeSessionId = sessionId;
           let history: PromptHistoryMessage[] = [];
+          let sessionMemoryContext: SessionMemoryContext = {
+            summary: null,
+            memory: {},
+          };
 
           writeEvent("stage", { stage: "session", label: "正在准备会话" });
           if (!activeSessionId) {
@@ -470,7 +587,19 @@ export async function POST(request: Request) {
             writeEvent("session", { sessionId: activeSessionId });
           } else {
             const existingSessionId = activeSessionId;
-            history = await stageTimer.track("history", () => loadRecentHistory(existingSessionId));
+            const historyResult = await stageTimer.track("history", async () => {
+              const [recentHistory, memoryContext] = await Promise.all([
+                loadRecentHistory(existingSessionId),
+                loadSessionMemoryContext(existingSessionId),
+              ]);
+
+              return {
+                memoryContext,
+                recentHistory,
+              };
+            });
+            history = historyResult.recentHistory;
+            sessionMemoryContext = historyResult.memoryContext;
             writeEvent("session", { sessionId: activeSessionId });
           }
           activeSessionIdForLog = activeSessionId;
@@ -513,7 +642,9 @@ export async function POST(request: Request) {
           } else {
             writeEvent("stage", { stage: "prompt", label: "正在整理回答依据" });
             const promptStartedAt = Date.now();
-            const messages = buildChatMessages(message, chunks, history, intentProfile);
+            const messages = buildChatMessages(message, chunks, history, intentProfile, {
+              sessionSummary: sessionMemoryContext.summary,
+            });
             stageTimer.mark("prompt", promptStartedAt);
 
             writeEvent("stage", { stage: "answer", label: "正在生成回答" });
@@ -533,6 +664,15 @@ export async function POST(request: Request) {
               insert into public.chat_messages (session_id, role, content, sources)
               values (${activeSessionId}, 'assistant', ${answer}, ${sql.json(answerSources)})
             `);
+
+          await stageTimer.track("memory", async () => {
+            try {
+              const historyForMemory = await loadHistoryForMemory(activeSessionId);
+              await refreshSessionSummary(activeSessionId, sessionMemoryContext.summary, historyForMemory);
+            } catch {
+              // 摘要刷新是辅助记忆能力，失败不能影响本次回答入库和返回。
+            }
+          });
 
           await stageTimer.track("update_session", () => sql`
               update public.chat_sessions
