@@ -995,6 +995,206 @@ POST /api/chat
 用户不再面对长时间空白等待。
 ```
 
+### 2.1 本阶段已完成改造
+
+本阶段没有保留旧 JSON 接口。按照当前产品方向，`POST /api/chat` 已直接改造成 SSE 流式接口。
+
+```text
+用户提问
+-> page.tsx submitQuestion()
+-> fetch("/api/chat")
+-> route.ts POST()
+-> 准备 session / history
+-> 写入 user message
+-> rewriteQuestionForRetrieval()
+-> detectIntentProfile()
+-> createQueryEmbedding()
+-> retrieveKnowledgeForQuestion()
+-> prepareRetrievedKnowledge()
+-> buildChatMessages()
+-> generateChatAnswerStream()
+-> selectAnswerSources()
+-> 写入 assistant message + 实际采用依据
+-> writeChatRequestLog()
+-> done 事件返回完整 answer + sources
+```
+
+### 2.2 后端文件和方法
+
+```text
+apps/web/src/app/api/chat/route.ts
+```
+
+核心方法：
+
+```text
+POST()
+```
+
+作用：
+
+```text
+AI 装修顾问主入口。
+现在返回 text/event-stream，不再等待完整回答后一次性返回 JSON。
+```
+
+流式事件：
+
+```text
+stage：告诉前端当前阶段，例如正在检索知识库、正在生成回答、正在确认回答依据。
+session：返回后端创建或确认的会话 ID。
+token：返回模型生成的增量文本。
+done：返回完整回答、会话 ID、实际采用依据。
+error：返回流式过程中的错误。
+```
+
+新增方法：
+
+```text
+buildEvidenceCandidateText()
+```
+
+作用：
+
+```text
+把已经检索并进入回答候选池的 chunks 转成短文本。
+只保留 chunk_id、来源文件、章节、层级、模块和截断正文。
+它服务于回答后的依据筛选，不重新查知识库。
+```
+
+新增方法：
+
+```text
+parseEvidenceJson()
+```
+
+作用：
+
+```text
+解析引用判定模型返回的 JSON。
+兼容模型返回 Markdown JSON 代码块的情况，避免格式轻微偏差导致整条回答失败。
+```
+
+新增方法：
+
+```text
+selectAnswerSources()
+```
+
+作用：
+
+```text
+在回答生成完成后，根据“最终回答 + 候选知识片段”判断哪些资料真正支撑了答案。
+这一步最多返回 4 条实际采用依据。
+如果判定失败，会回退到原检索 sources，保证用户回答不会因为二次判定失败而中断。
+```
+
+为什么这样做：
+
+```text
+系统检索来源：系统认为可能相关，所以提供给 AI。
+实际采用依据：回答完成后，系统再判断这次答案真正用了哪些资料。
+
+这一步提升的是可解释性，不是重新检索知识库。
+```
+
+### 2.3 前端文件和方法
+
+```text
+apps/web/src/app/page.tsx
+```
+
+核心方法：
+
+```text
+submitQuestion()
+```
+
+作用：
+
+```text
+提交问题后立即插入用户消息和空的 assistant 消息。
+读取 /api/chat 的 SSE 响应。
+收到 token 时逐字追加到 assistant 消息。
+收到 done 时用完整 answer 校准内容，并写入实际采用依据 sources。
+```
+
+```text
+parseServerSentEvent()
+```
+
+作用：
+
+```text
+解析服务端 SSE 文本块。
+把 event/data 转成前端可以处理的结构。
+```
+
+```text
+apps/web/src/app/components/chat-workspace.tsx
+```
+
+展示变化：
+
+```text
+原来显示：知识库依据 N 条。
+现在显示：实际采用依据 N 条。
+
+每条依据可展示：
+- 知识库层级
+- 业务模块
+- 相似度
+- 来源文件
+- 章节
+- 支撑判断 reason
+```
+
+### 2.4 为什么不是直接展示检索 sources
+
+检索 sources 的意义：
+
+```text
+告诉系统：哪些知识资料可能和用户问题有关。
+```
+
+实际采用依据的意义：
+
+```text
+告诉用户：这次回答里的关键结论主要由哪些资料支撑。
+```
+
+例子：
+
+```text
+用户问：水电增项 8000 合理吗？
+
+系统可能检索到：
+1. 水电报价增项规则
+2. 合同漏项风险
+3. 防水证据保留
+4. 装修公司话术
+
+但最终回答真正用到的可能只有：
+1. 水电报价增项规则
+2. 合同漏项风险
+
+因此前端应该展示“实际采用依据”，而不是把所有候选来源都叫参考来源。
+```
+
+### 2.5 本阶段新增环境变量
+
+```env
+CHAT_EVIDENCE_TIMEOUT_MS=10000
+```
+
+含义：
+
+```text
+回答完成后，二次筛选实际采用依据的超时时间。
+默认 10000ms。
+它失败不会影响回答，只会回退到原检索来源。
+```
+
 ## 第 3 阶段：阶段状态反馈
 
 目标：

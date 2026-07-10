@@ -286,6 +286,90 @@ export async function generateChatAnswer(
 }
 
 /**
+ * 以流式方式调用聊天模型。
+ * 用于 GPT 式逐步输出体验；调用方通过 onToken 接收增量文本，函数返回完整回答。
+ */
+export async function generateChatAnswerStream(
+  messages: ChatMessage[],
+  options?: {
+    onToken?: (token: string) => void | Promise<void>;
+    timeoutMs?: number;
+  },
+) {
+  const response = await fetch(getDashScopeChatCompletionsUrl(), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${getDashScopeApiKey()}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: getChatModel(),
+      messages,
+      stream: true,
+      temperature: 0.2,
+    }),
+    signal: createTimeoutSignal(options?.timeoutMs),
+  });
+
+  if (!response.ok || !response.body) {
+    await parseDashScopeResponse(response);
+    throw new Error("DashScope stream response is missing body");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+
+      if (!line || !line.startsWith("data:")) {
+        continue;
+      }
+
+      const data = line.replace(/^data:\s*/, "");
+
+      if (data === "[DONE]") {
+        continue;
+      }
+
+      const payload = JSON.parse(data) as {
+        choices?: Array<{
+          delta?: {
+            content?: string;
+          };
+          message?: {
+            content?: string;
+          };
+        }>;
+      };
+      const token = payload.choices?.[0]?.delta?.content || payload.choices?.[0]?.message?.content || "";
+
+      if (!token) {
+        continue;
+      }
+
+      answer += token;
+      await options?.onToken?.(token);
+    }
+  }
+
+  return answer;
+}
+
+/**
  * 从视觉模型返回文本中提取 JSON 对象。
  * 模型偶尔会包 Markdown code fence，因此需要先截取 JSON 再 parse。
  */

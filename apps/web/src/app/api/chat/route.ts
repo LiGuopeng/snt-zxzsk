@@ -1,32 +1,23 @@
-import { NextResponse } from "next/server";
-
 import { writeChatRequestLog } from "@/lib/ai/chat-logs";
-import { createQueryEmbedding, generateChatAnswer } from "@/lib/ai/dashscope";
+import { createQueryEmbedding, generateChatAnswer, generateChatAnswerStream } from "@/lib/ai/dashscope";
 import { detectIntentProfile } from "@/lib/ai/intent";
 import { buildChatMessages, type PromptHistoryMessage } from "@/lib/ai/prompt";
 import {
+  type KnowledgeChunk,
+  type KnowledgeSource,
   prepareRetrievedKnowledge,
   retrieveKnowledgeForQuestion,
 } from "@/lib/ai/retrieval";
 import { createPostgresClient } from "@/lib/db/postgres";
 
-type ChatRequestBody = {
+type ChatStreamRequestBody = {
   // 用户本次输入的原始问题。
   message?: unknown;
   // 前端传入已有会话 ID 时，表示继续旧会话；不传则后端创建新会话。
   sessionId?: unknown;
 };
 
-// 单条用户输入最大长度，防止超长文本拖慢 embedding、检索和最终回答。
-const MAX_MESSAGE_CHARS = 1000;
-// 进入 prompt 的历史消息条数上限；只取最近上下文，避免 prompt 无限膨胀。
-const HISTORY_LIMIT = 6;
-// 追问改写是辅助步骤，必须比最终回答更短超时，避免拖垮主链路。
-const QUESTION_REWRITE_TIMEOUT_MS = Number(process.env.CHAT_REWRITE_TIMEOUT_MS || 8000);
-
-// stage_timings 会写入 chat_request_logs，用来定位“到底是哪一步慢”。
-// 例如 answer 很高说明模型生成慢，retrieval 很高说明数据库/pgvector 慢。
-type ChatStage =
+type ChatStreamStage =
   | "parse_request"
   | "session"
   | "history"
@@ -38,20 +29,25 @@ type ChatStage =
   | "prepare_knowledge"
   | "prompt"
   | "answer"
+  | "evidence"
   | "write_assistant_message"
   | "update_session"
   | "write_log";
 
+const MAX_MESSAGE_CHARS = 1000;
+const HISTORY_LIMIT = 6;
+const QUESTION_REWRITE_TIMEOUT_MS = Number(process.env.CHAT_REWRITE_TIMEOUT_MS || 8000);
+const ANSWER_EVIDENCE_TIMEOUT_MS = Number(process.env.CHAT_EVIDENCE_TIMEOUT_MS || 10000);
+const ANSWER_EVIDENCE_SOURCE_LIMIT = 4;
+
 /**
- * 创建本次 /api/chat 请求的阶段计时器。
- * 用于把关键步骤耗时写入 chat_request_logs.stage_timings，方便线上排查慢请求。
+ * 创建流式接口使用的阶段计时器。
+ * 计时字段和 /api/chat 保持一致，方便 JSON 接口与 stream 接口统一排查。
  */
 function createStageTimer() {
-  // timings 保存每个阶段累计耗时；同一阶段可能被调用多次，所以用累加。
-  const timings: Partial<Record<ChatStage, number>> = {};
+  const timings: Partial<Record<ChatStreamStage, number>> = {};
 
-  async function track<T>(stage: ChatStage, action: () => Promise<T>) {
-    // track 包住异步阶段，成功或失败都会记录耗时，方便排查异常路径。
+  async function track<T>(stage: ChatStreamStage, action: () => Promise<T>) {
     const startedAt = Date.now();
 
     try {
@@ -61,8 +57,7 @@ function createStageTimer() {
     }
   }
 
-  function mark(stage: ChatStage, startedAt: number) {
-    // mark 用于同步阶段，例如解析 body、组装 prompt。
+  function mark(stage: ChatStreamStage, startedAt: number) {
     timings[stage] = (timings[stage] || 0) + Date.now() - startedAt;
   }
 
@@ -75,67 +70,23 @@ function createStageTimer() {
   return {
     mark,
     snapshot,
-    timings,
     track,
   };
 }
 
 /**
- * 把未知异常统一转成可记录、可返回的字符串。
- * 避免 catch 到非 Error 对象时日志里出现空错误。
+ * 将服务端事件编码成 SSE 文本。
+ * 前端按 event/data 解析，分别处理 stage、session、token、done、error。
  */
-function getErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "Unknown error";
-}
-
-/**
- * 判断异常是否属于超时类问题。
- * DashScope、fetch、AbortSignal 在不同环境下的超时文案不完全一致，所以这里做宽松匹配。
- */
-function isTimeoutError(error: unknown) {
-  const message = getErrorMessage(error).toLowerCase();
-
-  return (
-    message.includes("timeout") ||
-    message.includes("timed out") ||
-    message.includes("aborted") ||
-    (error instanceof DOMException && error.name === "TimeoutError")
-  );
-}
-
-/**
- * 把底层异常转换成前端可理解的错误响应。
- * 当前先区分 AI_TIMEOUT 和 CHAT_FAILED，后续可以继续细分 DB_TIMEOUT、RETRIEVAL_FAILED。
- */
-function createChatErrorResponse(error: unknown) {
-  if (isTimeoutError(error)) {
-    return {
-      status: 504,
-      body: {
-        ok: false,
-        error: "AI 服务响应超时，请稍后重试或缩短问题后再问。",
-        errorCode: "AI_TIMEOUT",
-      },
-    };
-  }
-
-  return {
-    status: 500,
-    body: {
-      ok: false,
-      error: getErrorMessage(error),
-      errorCode: "CHAT_FAILED",
-    },
-  };
+function encodeEvent(event: string, data: unknown) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
 /**
  * 从请求 body 中提取用户问题。
- * 这里做 trim 和最大长度限制，避免超长输入直接拖慢 embedding、检索和模型回答。
+ * 和 JSON 接口保持同样的长度限制，避免两条链路行为不一致。
  */
-function getRequestMessage(body: ChatRequestBody) {
-  // 第一版只接收 message 字段。
-  // 后续做多轮对话时，可以扩展 sessionId、history、userId 等字段。
+function getRequestMessage(body: ChatStreamRequestBody) {
   if (typeof body.message !== "string") {
     return null;
   }
@@ -151,9 +102,9 @@ function getRequestMessage(body: ChatRequestBody) {
 
 /**
  * 从请求 body 中提取会话 ID。
- * 为空表示创建新会话；有值表示继续左侧已有会话。
+ * 为空表示本次流式请求需要后端创建新会话。
  */
-function getSessionId(body: ChatRequestBody) {
+function getSessionId(body: ChatStreamRequestBody) {
   if (typeof body.sessionId !== "string") {
     return null;
   }
@@ -164,12 +115,10 @@ function getSessionId(body: ChatRequestBody) {
 }
 
 /**
- * 根据用户第一句话生成默认会话标题。
- * 这是轻量标题策略，避免每次新会话都额外调用模型生成标题。
+ * 生成轻量会话标题。
+ * 保持和 /api/chat 一致，避免流式和非流式创建出的会话标题规则不同。
  */
 function createTitleFromMessage(message: string) {
-  // 第一版用用户第一句话生成会话标题。
-  // 后期可以用模型总结标题，比如“卫生间墙砖空鼓整改判断”。
   const title = message.replace(/\s+/g, " ").trim();
 
   if (title.length <= 18) {
@@ -180,15 +129,11 @@ function createTitleFromMessage(message: string) {
 }
 
 /**
- * 读取当前会话最近的用户/助手消息，作为多轮追问上下文。
- * 查询发生在写入当前 user message 之前，因此不会把当前问题重复放进历史。
+ * 加载当前会话最近历史消息。
+ * 流式输出仍然需要历史上下文，否则多轮追问会退化成单轮问答。
  */
 async function loadRecentHistory(sessionId: string) {
   const sql = createPostgresClient();
-
-  // 查询当前 session 最近几条历史消息。
-  // 注意：这个函数在写入当前 user message 之前调用，
-  // 所以查到的是“真正的上文”，不会把当前问题重复放进历史。
   const rows = await sql<PromptHistoryMessage[]>`
     select role, content
     from (
@@ -209,8 +154,8 @@ async function loadRecentHistory(sessionId: string) {
 }
 
 /**
- * 把历史消息压缩成追问改写 prompt 可读的纯文本。
- * 这里只用于检索问题改写，不参与最终 sources 展示。
+ * 把历史消息整理成追问改写模型需要的文本。
+ * 这里只服务 retrieval question rewrite，不直接展示给用户。
  */
 function buildHistoryText(history: PromptHistoryMessage[]) {
   return history
@@ -219,22 +164,16 @@ function buildHistoryText(history: PromptHistoryMessage[]) {
 }
 
 /**
- * 将用户追问改写成适合知识库检索的完整问题。
- * 如果改写模型超时，则降级使用原问题，保证主回答链路不断。
+ * 流式链路中的追问改写。
+ * 如果改写超时，直接使用原问题继续检索，保证用户能尽快看到后续阶段。
  */
 async function rewriteQuestionForRetrieval(question: string, history: PromptHistoryMessage[]) {
-  // RAG 里有两次“理解问题”：
-  // 1. 先把当前问题改写成完整问题，用于 embedding 检索知识库。
-  // 2. 再把历史、知识库资料和原始问题交给聊天模型生成回答。
-  // 这样用户追问“那卫生间墙上呢？”时，检索会变成“卫生间墙砖空鼓是否需要重铺”这类完整问题。
   if (history.length === 0) {
     return question;
   }
 
-  let rewritten: string;
-
   try {
-    rewritten = await generateChatAnswer(
+    const rewritten = await generateChatAnswer(
       [
         {
           role: "system",
@@ -262,202 +201,345 @@ async function rewriteQuestionForRetrieval(question: string, history: PromptHist
         timeoutMs: QUESTION_REWRITE_TIMEOUT_MS,
       },
     );
+
+    return rewritten.replace(/^["“]|["”]$/g, "").trim().slice(0, MAX_MESSAGE_CHARS) || question;
   } catch (error) {
-    // 改写只是提升检索质量的辅助步骤，失败或超时不能阻断主回答链路。
     if (isTimeoutError(error)) {
       return question;
     }
 
     throw error;
   }
-
-  return rewritten.replace(/^["“]|["”]$/g, "").trim().slice(0, MAX_MESSAGE_CHARS) || question;
 }
 
 /**
- * AI 装修顾问主入口。
- * 负责会话管理、问题改写、embedding、知识库检索、prompt 组装、模型回答、消息落库和请求日志。
+ * 将未知异常转换成字符串，保证 SSE error 事件和日志都有可读错误信息。
  */
-export async function POST(request: Request) {
-  // startedAt 用于计算整次 /api/chat 请求总耗时。
-  const startedAt = Date.now();
-  // stageTimer 记录细分阶段耗时，最终写入 chat_request_logs.stage_timings。
-  const stageTimer = createStageTimer();
-  // 以下 *_ForLog 变量用于 catch 分支；即使中途失败，也尽量把已知上下文写进日志。
-  let activeSessionIdForLog: string | null = null;
-  let messageForLog = "";
-  let retrievalQuestionForLog: string | undefined;
-  let intentProfileForLog: ReturnType<typeof detectIntentProfile> | undefined;
-  let retrievalStatsForLog: Awaited<ReturnType<typeof retrieveKnowledgeForQuestion>>["stats"] | undefined;
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+/**
+ * 判断是否为超时类异常。
+ * 和 JSON 接口保持一致，方便前端统一展示 AI_TIMEOUT。
+ */
+function isTimeoutError(error: unknown) {
+  const message = getErrorMessage(error).toLowerCase();
+
+  return (
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("aborted") ||
+    (error instanceof DOMException && error.name === "TimeoutError")
+  );
+}
+
+/**
+ * 将异常转换成流式接口的错误事件体。
+ * 流式请求中途失败时 HTTP 状态通常已经是 200，所以错误要通过 SSE 事件通知前端。
+ */
+function createStreamError(error: unknown) {
+  if (isTimeoutError(error)) {
+    return {
+      error: "AI 服务响应超时，请稍后重试或缩短问题后再问。",
+      errorCode: "AI_TIMEOUT",
+    };
+  }
+
+  return {
+    error: getErrorMessage(error),
+    errorCode: "CHAT_FAILED",
+  };
+}
+
+/**
+ * 把候选知识片段整理成“引用判定”模型可读的短文本。
+ * 这里只保留 chunk id、来源和截断正文，避免二次判定 prompt 过长。
+ */
+function buildEvidenceCandidateText(chunks: KnowledgeChunk[]) {
+  return chunks
+    .slice(0, 10)
+    .map((chunk, index) =>
+      [
+        `【候选 ${index + 1}】`,
+        `chunk_id：${chunk.id}`,
+        `来源文件：${chunk.source_file}`,
+        `章节：${chunk.section || chunk.title || "未标注"}`,
+        `层级：${chunk.layer || "未标注"}`,
+        `模块：${chunk.module || "未标注"}`,
+        "内容：",
+        chunk.content.trim().slice(0, 700),
+      ].join("\n"),
+    )
+    .join("\n\n---\n\n");
+}
+
+/**
+ * 从模型返回中提取 JSON 对象。
+ * 引用判定要求模型只返回 JSON，但这里仍兼容 ```json code fence，提升稳定性。
+ */
+function parseEvidenceJson(content: string) {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const jsonText = fenced?.[1]?.trim() || trimmed;
+  const start = jsonText.indexOf("{");
+  const end = jsonText.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("Evidence response does not contain a JSON object");
+  }
+
+  return JSON.parse(jsonText.slice(start, end + 1)) as {
+    sources?: Array<{
+      chunk_id?: unknown;
+      reason?: unknown;
+    }>;
+  };
+}
+
+/**
+ * 在回答生成完成后，反向判断“哪些知识片段真正支撑了本次答案”。
+ * 注意：这一步不重新检索知识库，只在已经传给回答模型的候选 chunks 里筛选。
+ */
+async function selectAnswerSources(answer: string, chunks: KnowledgeChunk[], fallbackSources: KnowledgeSource[]) {
+  if (!answer.trim() || chunks.length === 0) {
+    return [];
+  }
 
   try {
-    const parseStartedAt = Date.now();
-    const body = (await request.json().catch(() => null)) as ChatRequestBody | null;
-    const message = body ? getRequestMessage(body) : null;
-    const sessionId = body ? getSessionId(body) : null;
-    stageTimer.mark("parse_request", parseStartedAt);
-
-    if (!message) {
-      return NextResponse.json(
+    const payloadText = await generateChatAnswer(
+      [
         {
-          ok: false,
-          error: "message is required",
+          role: "system",
+          content: [
+            "你负责判断装修问答答案实际使用了哪些知识库候选资料。",
+            "只能从候选资料里选择，不能新增来源。",
+            "只选择能直接支撑答案关键结论或建议的资料。",
+            "如果某条资料只是相似但答案没有使用，不要选择。",
+            "最多选择 4 条。",
+            "必须只返回 JSON，不要解释。",
+          ].join("\n"),
         },
-        { status: 400 },
-      );
-    }
-
-    messageForLog = message;
-    const sql = createPostgresClient();
-    // activeSessionId 是本次请求最终使用的会话 ID：来自前端或后端新建。
-    let activeSessionId = sessionId;
-    // history 是当前问题之前的最近对话，用于追问改写和最终回答上下文。
-    let history: PromptHistoryMessage[] = [];
-
-    // 正式会话链路：
-    // 如果前端没有传 sessionId，就在后端创建一个新会话。
-    // 这样 /api/chat 既支持“已有会话继续问”，也支持“直接发第一句话创建会话”。
-    if (!activeSessionId) {
-      const [session] = await stageTimer.track("session", () => sql<{ id: string }[]>`
-          insert into public.chat_sessions (title, updated_at)
-          values (${createTitleFromMessage(message)}, now())
-          returning id
-        `);
-
-      activeSessionId = session.id;
-    } else {
-      const existingSessionId = activeSessionId;
-      history = await stageTimer.track("history", () => loadRecentHistory(existingSessionId));
-    }
-    activeSessionIdForLog = activeSessionId;
-
-    // 先写入用户消息，保证即使后面模型调用失败，也能在后台看到用户问了什么。
-    await stageTimer.track("write_user_message", () => sql`
-        insert into public.chat_messages (session_id, role, content)
-        values (${activeSessionId}, 'user', ${message})
-      `);
-
-    // 1. 把用户问题转成 query embedding。
-    // 这一步不是重复生成知识库 embedding，而是给“本次用户问题”生成查询向量。
-    // 如果是追问，会先结合历史改写成完整检索问题，再生成 query embedding。
-    // retrievalQuestion 是用于知识库检索的问题；可能是原问题，也可能是结合历史改写后的完整问题。
-    const retrievalQuestion = await stageTimer.track("rewrite_question", () =>
-      rewriteQuestionForRetrieval(message, history),
+        {
+          role: "user",
+          content: [
+            "【AI 最终回答】",
+            answer,
+            "",
+            "【候选知识资料】",
+            buildEvidenceCandidateText(chunks),
+            "",
+            "请返回 JSON，格式：",
+            '{"sources":[{"chunk_id":"knowledge_chunks.id","reason":"这条资料支撑了答案里的哪个判断，20字以内"}]}',
+          ].join("\n"),
+        },
+      ],
+      {
+        timeoutMs: ANSWER_EVIDENCE_TIMEOUT_MS,
+      },
     );
-    retrievalQuestionForLog = retrievalQuestion;
-    const intentStartedAt = Date.now();
-    // intentProfile 决定回答策略、强制召回层级和关键词兜底词。
-    const intentProfile = detectIntentProfile(retrievalQuestion);
-    stageTimer.mark("intent", intentStartedAt);
-    intentProfileForLog = intentProfile;
-    // queryEmbedding 只用于本次检索，不写入数据库。
-    const queryEmbedding = await stageTimer.track("embedding", () => createQueryEmbedding(retrievalQuestion));
+    const payload = parseEvidenceJson(payloadText);
+    const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+    const selectedSources: KnowledgeSource[] = [];
+    const seen = new Set<string>();
 
-    // 2. 用 query embedding 去 PostgreSQL pgvector 检索相关知识片段。
-    // 正式上线第一版：普通向量召回 + 意图强制召回 + embedding 缺失时关键词兜底。
-    // retrievalResult 包含候选知识片段和召回统计，用于回答和日志审计。
-    const retrievalResult = await stageTimer.track("retrieval", () =>
-      retrieveKnowledgeForQuestion(queryEmbedding, intentProfile),
-    );
-    retrievalStatsForLog = retrievalResult.stats;
+    for (const item of payload.sources || []) {
+      if (typeof item.chunk_id !== "string" || seen.has(item.chunk_id)) {
+        continue;
+      }
 
-    // 3. 过滤太短 chunk，并整理 sources。
-    // sources 会返回给前端，用来展示答案依据。
-    const prepareStartedAt = Date.now();
-    // chunks 进入 prompt，sources 返回前端展示；两者都来自同一批召回结果。
-    const { chunks, sources } = prepareRetrievedKnowledge(retrievalResult.chunks);
-    stageTimer.mark("prepare_knowledge", prepareStartedAt);
+      const chunk = chunkById.get(item.chunk_id);
 
-    if (chunks.length === 0) {
-      const fallbackAnswer =
-        "目前没有检索到足够相关的知识库资料，暂时不能直接判断。你可以补充装修阶段、现场照片描述、合同或报价明细，我再帮你继续分析。";
+      if (!chunk) {
+        continue;
+      }
 
-      await stageTimer.track("write_assistant_message", () => sql`
-          insert into public.chat_messages (session_id, role, content, sources)
-          values (${activeSessionId}, 'assistant', ${fallbackAnswer}, ${sql.json(sources)})
-        `);
-
-      await stageTimer.track("write_log", () => writeChatRequestLog({
-        sessionId: activeSessionId,
-        userMessage: message,
-        retrievalQuestion,
-        intentProfile,
-        retrievalStats: retrievalResult.stats,
-        sources,
-        answer: fallbackAnswer,
-        status: "ok",
-        durationMs: Date.now() - startedAt,
-        stageTimings: stageTimer.snapshot(),
-      }));
-
-      return NextResponse.json({
-        ok: true,
-        sessionId: activeSessionId,
-        answer: fallbackAnswer,
-        sources,
+      seen.add(item.chunk_id);
+      selectedSources.push({
+        chunk_id: chunk.id,
+        source_file: chunk.source_file,
+        section: chunk.section,
+        layer: chunk.layer,
+        module: chunk.module,
+        similarity: chunk.similarity,
+        reason: typeof item.reason === "string" ? item.reason.trim().slice(0, 60) : undefined,
       });
+
+      if (selectedSources.length >= ANSWER_EVIDENCE_SOURCE_LIMIT) {
+        break;
+      }
     }
 
-    // 4. 把历史对话、用户问题、知识片段、回答规则组装成 messages。
-    // 现在模型能看到最近上文，例如用户追问“那如果在卫生间墙上呢？”。
-    const promptStartedAt = Date.now();
-    const messages = buildChatMessages(message, chunks, history, intentProfile);
-    stageTimer.mark("prompt", promptStartedAt);
+    return selectedSources.length > 0 ? selectedSources : fallbackSources;
+  } catch {
+    return fallbackSources;
+  }
+}
 
-    // 5. 调用 qwen-plus 生成最终回答。
-    const answer = await stageTimer.track("answer", () => generateChatAnswer(messages));
+/**
+ * AI 装修顾问流式接口。
+ * 和 /api/chat 共享同一套 RAG 思路，但回答阶段改为 token 级增量输出。
+ */
+export async function POST(request: Request) {
+  const body = (await request.json().catch(() => null)) as ChatStreamRequestBody | null;
+  const message = body ? getRequestMessage(body) : null;
+  const sessionId = body ? getSessionId(body) : null;
 
-    // 写入 AI 回复和来源，左侧点击会话恢复时会用到。
-    await stageTimer.track("write_assistant_message", () => sql`
-        insert into public.chat_messages (session_id, role, content, sources)
-        values (${activeSessionId}, 'assistant', ${answer}, ${sql.json(sources)})
-      `);
-
-    // 更新会话标题和更新时间。
-    // 如果还是“新对话”，用用户第一句话替换；已有标题则只更新时间。
-    await stageTimer.track("update_session", () => sql`
-        update public.chat_sessions
-        set title = ${createTitleFromMessage(message)}, updated_at = now()
-        where id = ${activeSessionId}
-      `);
-
-    await stageTimer.track("write_log", () => writeChatRequestLog({
-      sessionId: activeSessionId,
-      userMessage: message,
-      retrievalQuestion,
-      intentProfile,
-      retrievalStats: retrievalResult.stats,
-      sources,
-      answer,
-      status: "ok",
-      durationMs: Date.now() - startedAt,
-      stageTimings: stageTimer.snapshot(),
-    }));
-
-    return NextResponse.json({
-      ok: true,
-      sessionId: activeSessionId,
-      answer,
-      sources,
-    });
-  } catch (error) {
-    const response = createChatErrorResponse(error);
-
-    await stageTimer.track("write_log", () => writeChatRequestLog({
-      sessionId: activeSessionIdForLog,
-      userMessage: messageForLog || "unknown",
-      retrievalQuestion: retrievalQuestionForLog,
-      intentProfile: intentProfileForLog,
-      retrievalStats: retrievalStatsForLog,
-      status: "error",
-      errorMessage: getErrorMessage(error),
-      durationMs: Date.now() - startedAt,
-      stageTimings: stageTimer.snapshot(),
-    }));
-
-    return NextResponse.json(
-      response.body,
-      { status: response.status },
+  if (!message) {
+    return Response.json(
+      {
+        ok: false,
+        error: "message is required",
+      },
+      { status: 400 },
     );
   }
+
+  const encoder = new TextEncoder();
+
+  return new Response(
+    new ReadableStream({
+      async start(controller) {
+        const startedAt = Date.now();
+        const stageTimer = createStageTimer();
+        const writeEvent = (event: string, data: unknown) => controller.enqueue(encoder.encode(encodeEvent(event, data)));
+        let activeSessionIdForLog: string | null = null;
+        let retrievalQuestionForLog: string | undefined;
+        let intentProfileForLog: ReturnType<typeof detectIntentProfile> | undefined;
+        let retrievalStatsForLog: Awaited<ReturnType<typeof retrieveKnowledgeForQuestion>>["stats"] | undefined;
+        let answer = "";
+
+        try {
+          const sql = createPostgresClient();
+          let activeSessionId = sessionId;
+          let history: PromptHistoryMessage[] = [];
+
+          writeEvent("stage", { stage: "session", label: "正在准备会话" });
+          if (!activeSessionId) {
+            const [session] = await stageTimer.track("session", () => sql<{ id: string }[]>`
+                insert into public.chat_sessions (title, updated_at)
+                values (${createTitleFromMessage(message)}, now())
+                returning id
+              `);
+
+            activeSessionId = session.id;
+            writeEvent("session", { sessionId: activeSessionId });
+          } else {
+            const existingSessionId = activeSessionId;
+            history = await stageTimer.track("history", () => loadRecentHistory(existingSessionId));
+            writeEvent("session", { sessionId: activeSessionId });
+          }
+          activeSessionIdForLog = activeSessionId;
+
+          await stageTimer.track("write_user_message", () => sql`
+              insert into public.chat_messages (session_id, role, content)
+              values (${activeSessionId}, 'user', ${message})
+            `);
+
+          writeEvent("stage", { stage: "rewrite_question", label: "正在理解问题" });
+          const retrievalQuestion = await stageTimer.track("rewrite_question", () =>
+            rewriteQuestionForRetrieval(message, history),
+          );
+          retrievalQuestionForLog = retrievalQuestion;
+
+          const intentStartedAt = Date.now();
+          const intentProfile = detectIntentProfile(retrievalQuestion);
+          stageTimer.mark("intent", intentStartedAt);
+          intentProfileForLog = intentProfile;
+
+          writeEvent("stage", { stage: "embedding", label: "正在生成检索向量" });
+          const queryEmbedding = await stageTimer.track("embedding", () => createQueryEmbedding(retrievalQuestion));
+
+          writeEvent("stage", { stage: "retrieval", label: "正在检索知识库" });
+          const retrievalResult = await stageTimer.track("retrieval", () =>
+            retrieveKnowledgeForQuestion(queryEmbedding, intentProfile),
+          );
+          retrievalStatsForLog = retrievalResult.stats;
+
+          const prepareStartedAt = Date.now();
+          const { chunks, sources } = prepareRetrievedKnowledge(retrievalResult.chunks);
+          let answerSources = sources;
+          stageTimer.mark("prepare_knowledge", prepareStartedAt);
+
+          if (chunks.length === 0) {
+            answer =
+              "目前没有检索到足够相关的知识库资料，暂时不能直接判断。你可以补充装修阶段、现场照片描述、合同或报价明细，我再帮你继续分析。";
+            writeEvent("token", { token: answer });
+          } else {
+            writeEvent("stage", { stage: "prompt", label: "正在整理回答依据" });
+            const promptStartedAt = Date.now();
+            const messages = buildChatMessages(message, chunks, history, intentProfile);
+            stageTimer.mark("prompt", promptStartedAt);
+
+            writeEvent("stage", { stage: "answer", label: "正在生成回答" });
+            answer = await stageTimer.track("answer", () =>
+              generateChatAnswerStream(messages, {
+                onToken: (token) => writeEvent("token", { token }),
+              }),
+            );
+          }
+
+          writeEvent("stage", { stage: "evidence", label: "正在确认回答依据" });
+          answerSources = await stageTimer.track("evidence", () =>
+            selectAnswerSources(answer, chunks, sources),
+          );
+
+          await stageTimer.track("write_assistant_message", () => sql`
+              insert into public.chat_messages (session_id, role, content, sources)
+              values (${activeSessionId}, 'assistant', ${answer}, ${sql.json(answerSources)})
+            `);
+
+          await stageTimer.track("update_session", () => sql`
+              update public.chat_sessions
+              set title = ${createTitleFromMessage(message)}, updated_at = now()
+              where id = ${activeSessionId}
+            `);
+
+          await stageTimer.track("write_log", () => writeChatRequestLog({
+            sessionId: activeSessionId,
+            userMessage: message,
+            retrievalQuestion,
+            intentProfile,
+            retrievalStats: retrievalResult.stats,
+            sources: answerSources,
+            answer,
+            status: "ok",
+            durationMs: Date.now() - startedAt,
+            stageTimings: stageTimer.snapshot(),
+          }));
+
+          writeEvent("done", {
+            answer,
+            sessionId: activeSessionId,
+            sources: answerSources,
+          });
+        } catch (error) {
+          const streamError = createStreamError(error);
+
+          await stageTimer.track("write_log", () => writeChatRequestLog({
+            sessionId: activeSessionIdForLog,
+            userMessage: message,
+            retrievalQuestion: retrievalQuestionForLog,
+            intentProfile: intentProfileForLog,
+            retrievalStats: retrievalStatsForLog,
+            status: "error",
+            errorMessage: getErrorMessage(error),
+            durationMs: Date.now() - startedAt,
+            stageTimings: stageTimer.snapshot(),
+          }));
+
+          writeEvent("error", streamError);
+        } finally {
+          controller.close();
+        }
+      },
+    }),
+    {
+      headers: {
+        "cache-control": "no-cache, no-transform",
+        "content-type": "text/event-stream; charset=utf-8",
+        "x-accel-buffering": "no",
+      },
+    },
+  );
 }

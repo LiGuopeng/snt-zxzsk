@@ -31,6 +31,8 @@ export type KnowledgeChunk = {
 };
 
 export type KnowledgeSource = {
+  // 对应的 knowledge_chunks.id，用于回答生成后反向筛选“实际采用依据”。
+  chunk_id?: string;
   // 前端展示的来源文件。
   source_file: string;
   // 前端展示的章节。
@@ -41,6 +43,8 @@ export type KnowledgeSource = {
   module: string | null;
   // 来源相似度，用于调试召回质量。
   similarity: number;
+  // AI 对这条资料为何支撑本次回答的简短说明；旧数据或兜底来源可能为空。
+  reason?: string;
 };
 
 export type RetrievalStats = {
@@ -108,6 +112,7 @@ function dedupeSources(chunks: KnowledgeChunk[], limit: number) {
 
     seen.add(key);
     sources.push({
+      chunk_id: chunk.id,
       source_file: chunk.source_file,
       section: chunk.section,
       layer: chunk.layer,
