@@ -544,22 +544,410 @@ Agent Router 复杂度最高，必须等前面链路稳定后再做。
 简单问题回答速度更快。
 ```
 
-已落地：
+### 6.1.1 优化后的调用链路
 
 ```text
-1. CHAT_REWRITE_TIMEOUT_MS 控制追问改写超时，默认 8000ms。
-2. 追问改写超时自动降级为原问题，不阻断主回答链路。
-3. 默认向量召回从 8 条降到 6 条。
-4. sources 默认从 6 条降到 4 条。
-5. 强制层级召回从 4 条降到 3 条。
-6. prompt 知识库上下文从 9000 字降到 6000 字。
-7. 历史上下文从 3000 字降到 1800 字。
-8. 超时统一返回 errorCode = AI_TIMEOUT。
-9. 普通失败返回 errorCode = CHAT_FAILED。
-10. chat_request_logs 新增 stage_timings，记录 parse_request、session、history、rewrite_question、embedding、retrieval、prompt、answer、write_log 等阶段耗时。
+POST /api/chat
+  -> parse_request
+  -> session / history
+  -> write_user_message
+  -> rewrite_question
+       -> 如果超时：降级使用原问题
+  -> intent
+  -> embedding
+  -> retrieval
+       -> 普通向量召回
+       -> 强制层级召回
+       -> 关键词兜底
+  -> prepare_knowledge
+       -> 过滤过短 chunk
+       -> sources 去重并限制数量
+  -> prompt
+       -> 限制知识库上下文长度
+       -> 限制历史上下文长度
+  -> answer
+       -> 如果超时：返回 AI_TIMEOUT
+  -> write_assistant_message
+  -> update_session
+  -> write_log
+       -> 写入 duration_ms
+       -> 写入 stage_timings
 ```
 
-排查方式：
+第 1 阶段的核心不是改变回答逻辑，而是让每一步可控、可降级、可排查。
+
+### 6.1.2 改动 1：追问改写独立短超时
+
+涉及文件：
+
+```text
+apps/web/src/app/api/chat/route.ts
+apps/web/src/lib/ai/dashscope.ts
+```
+
+涉及方法：
+
+```text
+rewriteQuestionForRetrieval()
+generateChatAnswer()
+createTimeoutSignal()
+```
+
+改了什么：
+
+```text
+新增 CHAT_REWRITE_TIMEOUT_MS，默认 8000ms。
+generateChatAnswer 支持 options.timeoutMs。
+rewriteQuestionForRetrieval 调用 generateChatAnswer 时传入短超时。
+```
+
+意义：
+
+```text
+追问改写只是提升检索质量的辅助步骤，不应该拖垮整次回答。
+如果用户只是普通提问，或者改写模型响应慢，系统应该继续回答，而不是直接 timeout。
+```
+
+链路位置：
+
+```text
+用户问题
+-> rewriteQuestionForRetrieval
+-> generateChatAnswer(timeoutMs = CHAT_REWRITE_TIMEOUT_MS)
+-> 成功：使用改写后的检索问题
+-> 超时：使用原问题继续 embedding 和检索
+```
+
+### 6.1.3 改动 2：追问改写失败自动降级
+
+涉及文件：
+
+```text
+apps/web/src/app/api/chat/route.ts
+```
+
+涉及方法：
+
+```text
+rewriteQuestionForRetrieval()
+isTimeoutError()
+```
+
+改了什么：
+
+```text
+rewriteQuestionForRetrieval 内部 catch 超时错误。
+如果是 timeout/aborted/timed out，则直接 return question。
+非超时异常继续抛出，避免掩盖真实接口问题。
+```
+
+意义：
+
+```text
+用户追问时，改写失败最多影响检索精度，不应该导致整个 AI 装修顾问不可用。
+这属于可降级能力：辅助链路失败，主链路继续。
+```
+
+链路位置：
+
+```text
+rewrite_question
+-> 成功：retrievalQuestion = rewritten
+-> 超时：retrievalQuestion = original question
+-> 后续 embedding/retrieval/prompt/answer 正常执行
+```
+
+### 6.1.4 改动 3：错误分类更清楚
+
+涉及文件：
+
+```text
+apps/web/src/app/api/chat/route.ts
+```
+
+涉及方法：
+
+```text
+getErrorMessage()
+isTimeoutError()
+createChatErrorResponse()
+POST()
+```
+
+改了什么：
+
+```text
+把底层异常分成两类：
+AI_TIMEOUT：AI 服务响应超时。
+CHAT_FAILED：普通聊天失败。
+```
+
+接口返回：
+
+```json
+{
+  "ok": false,
+  "error": "AI 服务响应超时，请稍后重试或缩短问题后再问。",
+  "errorCode": "AI_TIMEOUT"
+}
+```
+
+意义：
+
+```text
+前端不再只显示 The operation was aborted due to timeout。
+用户能看懂发生了什么。
+程序员也能根据 errorCode 做前端提示、重试按钮或监控统计。
+```
+
+链路位置：
+
+```text
+任意阶段抛错
+-> catch(error)
+-> createChatErrorResponse(error)
+-> writeChatRequestLog(status = error)
+-> NextResponse.json({ ok:false, error, errorCode })
+```
+
+### 6.1.5 改动 4：降低知识库召回数量
+
+涉及文件：
+
+```text
+apps/web/src/lib/ai/retrieval.ts
+```
+
+涉及常量：
+
+```text
+DEFAULT_MATCH_COUNT：8 -> 6
+DEFAULT_SOURCE_COUNT：6 -> 4
+FORCED_MATCH_COUNT：4 -> 3
+KEYWORD_FALLBACK_COUNT：12 -> 8
+KEYWORD_QUERY_LIMIT：50 -> 30
+```
+
+涉及方法：
+
+```text
+matchKnowledgeChunks()
+matchKeywordKnowledgeChunks()
+retrieveKnowledgeForQuestion()
+prepareRetrievedKnowledge()
+dedupeSources()
+```
+
+改了什么：
+
+```text
+普通向量召回减少。
+强制层级召回减少。
+关键词兜底候选减少。
+返回前端 sources 数量减少。
+```
+
+意义：
+
+```text
+召回数量越大，prompt 越长，模型回答越慢。
+第 1 阶段先把上下文控制在更稳定的范围，降低超时概率。
+sources 减少到 4 条，也能避免前端来源列表过长。
+```
+
+链路位置：
+
+```text
+queryEmbedding
+-> retrieveKnowledgeForQuestion
+-> matchKnowledgeChunks(matchCount = 6)
+-> forced layer matchCount = 3
+-> keyword fallback limit = 8
+-> prepareRetrievedKnowledge
+-> sources limit = 4
+```
+
+### 6.1.6 改动 5：限制 prompt 上下文长度
+
+涉及文件：
+
+```text
+apps/web/src/lib/ai/prompt.ts
+```
+
+涉及常量：
+
+```text
+MAX_CONTEXT_CHARS：9000 -> 6000
+MAX_HISTORY_CHARS：3000 -> 1800
+```
+
+涉及方法：
+
+```text
+buildKnowledgeContext()
+buildHistoryContext()
+buildChatMessages()
+```
+
+改了什么：
+
+```text
+知识库资料进入 prompt 的最大字符数降低。
+历史对话进入 prompt 的最大字符数降低。
+```
+
+意义：
+
+```text
+prompt 越长，模型处理越慢，超时概率越高。
+装修问答不是越长越好，优先保证高质量资料进入模型。
+历史只用于理解追问，不应该把很久以前的对话一直塞给模型。
+```
+
+链路位置：
+
+```text
+chunks + history + intentProfile
+-> buildChatMessages
+-> buildKnowledgeContext 限制知识库上下文
+-> buildHistoryContext 限制历史上下文
+-> generateChatAnswer
+```
+
+### 6.1.7 改动 6：新增阶段耗时日志 stage_timings
+
+涉及文件：
+
+```text
+apps/web/src/app/api/chat/route.ts
+apps/web/src/lib/ai/chat-logs.ts
+infra/postgres/schema.sql
+```
+
+涉及方法：
+
+```text
+createStageTimer()
+stageTimer.track()
+stageTimer.mark()
+stageTimer.snapshot()
+writeChatRequestLog()
+```
+
+涉及数据库字段：
+
+```sql
+alter table public.chat_request_logs
+  add column if not exists stage_timings jsonb not null default '{}'::jsonb;
+```
+
+记录阶段：
+
+```text
+parse_request
+session
+history
+write_user_message
+rewrite_question
+intent
+embedding
+retrieval
+prepare_knowledge
+prompt
+answer
+write_assistant_message
+update_session
+write_log
+```
+
+意义：
+
+```text
+以前只能看到总耗时 duration_ms。
+现在可以知道慢在 embedding、retrieval、answer 还是数据库写入。
+后续优化不靠猜，可以直接看日志定位。
+```
+
+链路位置：
+
+```text
+POST /api/chat 开始
+-> createStageTimer()
+-> 每个关键步骤 stageTimer.track 或 stageTimer.mark
+-> writeChatRequestLog(stageTimings = stageTimer.snapshot())
+-> chat_request_logs.stage_timings
+```
+
+### 6.1.8 改动 7：schema 支持重复执行
+
+涉及文件：
+
+```text
+infra/postgres/schema.sql
+scripts/deploy-baota.sh
+```
+
+改了什么：
+
+```text
+schema.sql 中使用 add column if not exists 补 stage_timings。
+deploy-baota.sh 每次部署都会执行 schema.sql。
+```
+
+意义：
+
+```text
+服务器已经部署过一版，也可以直接重复执行 SQL。
+不会清空数据。
+不会因为字段已存在而中断部署。
+```
+
+链路位置：
+
+```text
+宝塔部署
+-> bash scripts/deploy-baota.sh
+-> psql "$DATABASE_URL" -f infra/postgres/schema.sql
+-> 自动补齐 chat_request_logs.stage_timings
+```
+
+### 6.1.9 第 1 阶段最终落地清单
+
+```text
+apps/web/src/app/api/chat/route.ts
+- 增加 CHAT_REWRITE_TIMEOUT_MS。
+- 增加 createStageTimer。
+- 增加 getErrorMessage / isTimeoutError / createChatErrorResponse。
+- 追问改写超时降级。
+- 每个关键阶段记录耗时。
+- catch 分支返回 AI_TIMEOUT / CHAT_FAILED。
+
+apps/web/src/lib/ai/dashscope.ts
+- generateChatAnswer 支持 options.timeoutMs。
+- createTimeoutSignal 支持传入局部 timeout。
+
+apps/web/src/lib/ai/retrieval.ts
+- 降低默认召回数量。
+- 降低 sources 数量。
+- 降低关键词兜底候选数量。
+
+apps/web/src/lib/ai/prompt.ts
+- 降低知识库上下文长度。
+- 降低历史上下文长度。
+
+apps/web/src/lib/ai/chat-logs.ts
+- ChatRequestLogInput 增加 stageTimings。
+- writeChatRequestLog 写入 stage_timings。
+
+infra/postgres/schema.sql
+- chat_request_logs 增加 stage_timings jsonb 字段。
+
+docs/AI装修顾问优化.md
+- 补充第 1 阶段优化说明、链路、意义和排查 SQL。
+```
+
+### 6.1.10 排查方式
 
 ```sql
 select
