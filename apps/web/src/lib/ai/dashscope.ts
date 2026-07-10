@@ -129,8 +129,9 @@ function getDashScopeTimeoutMs() {
   return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_DASHSCOPE_TIMEOUT_MS;
 }
 
-function createTimeoutSignal() {
-  return AbortSignal.timeout(getDashScopeTimeoutMs());
+function createTimeoutSignal(timeoutMs?: number) {
+  // 不同调用场景允许不同超时：追问改写要短，最终回答可以长一些。
+  return AbortSignal.timeout(timeoutMs || getDashScopeTimeoutMs());
 }
 
 async function parseDashScopeResponse(response: Response) {
@@ -177,7 +178,12 @@ export async function createQueryEmbedding(question: string) {
   return embedding as number[];
 }
 
-export async function generateChatAnswer(messages: ChatMessage[]) {
+export async function generateChatAnswer(
+  messages: ChatMessage[],
+  options?: {
+    timeoutMs?: number;
+  },
+) {
   // 回答生成只负责调用模型；知识库上下文、系统提示词等在上层 prompt 组装，职责分开。
   const response = await fetch(getDashScopeChatCompletionsUrl(), {
     method: "POST",
@@ -190,7 +196,7 @@ export async function generateChatAnswer(messages: ChatMessage[]) {
       messages,
       temperature: 0.2,
     }),
-    signal: createTimeoutSignal(),
+    signal: createTimeoutSignal(options?.timeoutMs),
   });
 
   const payload = await parseDashScopeResponse(response);

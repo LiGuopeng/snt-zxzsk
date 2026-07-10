@@ -17,6 +17,44 @@ type ChatRequestBody = {
 
 const MAX_MESSAGE_CHARS = 1000;
 const HISTORY_LIMIT = 6;
+const QUESTION_REWRITE_TIMEOUT_MS = Number(process.env.CHAT_REWRITE_TIMEOUT_MS || 8000);
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+function isTimeoutError(error: unknown) {
+  const message = getErrorMessage(error).toLowerCase();
+
+  return (
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("aborted") ||
+    (error instanceof DOMException && error.name === "TimeoutError")
+  );
+}
+
+function createChatErrorResponse(error: unknown) {
+  if (isTimeoutError(error)) {
+    return {
+      status: 504,
+      body: {
+        ok: false,
+        error: "AI 服务响应超时，请稍后重试或缩短问题后再问。",
+        errorCode: "AI_TIMEOUT",
+      },
+    };
+  }
+
+  return {
+    status: 500,
+    body: {
+      ok: false,
+      error: getErrorMessage(error),
+      errorCode: "CHAT_FAILED",
+    },
+  };
+}
 
 function getRequestMessage(body: ChatRequestBody) {
   // 第一版只接收 message 字段。
@@ -96,29 +134,45 @@ async function rewriteQuestionForRetrieval(question: string, history: PromptHist
     return question;
   }
 
-  const rewritten = await generateChatAnswer([
-    {
-      role: "system",
-      content: [
-        "你负责把装修问答里的追问改写成适合知识库检索的完整问题。",
-        "只能输出改写后的一个问题，不要解释，不要回答问题。",
-        "如果当前问题已经完整，就原样输出。",
-        "保留装修对象、空间、阶段、风险点、合同或报价等关键信息。",
-      ].join("\n"),
-    },
-    {
-      role: "user",
-      content: [
-        "【最近对话历史】",
-        buildHistoryText(history) || "暂无历史对话。",
-        "",
-        "【当前用户问题】",
-        question,
-        "",
-        "请输出适合检索装修知识库的完整问题：",
-      ].join("\n"),
-    },
-  ]);
+  let rewritten: string;
+
+  try {
+    rewritten = await generateChatAnswer(
+      [
+        {
+          role: "system",
+          content: [
+            "你负责把装修问答里的追问改写成适合知识库检索的完整问题。",
+            "只能输出改写后的一个问题，不要解释，不要回答问题。",
+            "如果当前问题已经完整，就原样输出。",
+            "保留装修对象、空间、阶段、风险点、合同或报价等关键信息。",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            "【最近对话历史】",
+            buildHistoryText(history) || "暂无历史对话。",
+            "",
+            "【当前用户问题】",
+            question,
+            "",
+            "请输出适合检索装修知识库的完整问题：",
+          ].join("\n"),
+        },
+      ],
+      {
+        timeoutMs: QUESTION_REWRITE_TIMEOUT_MS,
+      },
+    );
+  } catch (error) {
+    // 改写只是提升检索质量的辅助步骤，失败或超时不能阻断主回答链路。
+    if (isTimeoutError(error)) {
+      return question;
+    }
+
+    throw error;
+  }
 
   return rewritten.replace(/^["“]|["”]$/g, "").trim().slice(0, MAX_MESSAGE_CHARS) || question;
 }
@@ -260,6 +314,8 @@ export async function POST(request: Request) {
       sources,
     });
   } catch (error) {
+    const response = createChatErrorResponse(error);
+
     await writeChatRequestLog({
       sessionId: activeSessionIdForLog,
       userMessage: messageForLog || "unknown",
@@ -267,16 +323,13 @@ export async function POST(request: Request) {
       intentProfile: intentProfileForLog,
       retrievalStats: retrievalStatsForLog,
       status: "error",
-      errorMessage: error instanceof Error ? error.message : "Unknown error",
+      errorMessage: getErrorMessage(error),
       durationMs: Date.now() - startedAt,
     });
 
     return NextResponse.json(
-      {
-        ok: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-      { status: 500 },
+      response.body,
+      { status: response.status },
     );
   }
 }

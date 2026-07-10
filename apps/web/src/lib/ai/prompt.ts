@@ -2,8 +2,8 @@ import type { ChatMessage } from "@/lib/ai/dashscope";
 import type { IntentProfile } from "@/lib/ai/intent";
 import type { KnowledgeChunk } from "@/lib/ai/retrieval";
 
-const MAX_CONTEXT_CHARS = 9000;
-const MAX_HISTORY_CHARS = 3000;
+const MAX_CONTEXT_CHARS = 6000;
+const MAX_HISTORY_CHARS = 1800;
 
 export type PromptHistoryMessage = {
   role: "user" | "assistant";

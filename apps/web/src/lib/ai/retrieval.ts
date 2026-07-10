@@ -42,12 +42,12 @@ export type RetrievalResult = {
   stats: RetrievalStats;
 };
 
-const DEFAULT_MATCH_COUNT = 8;
-const DEFAULT_SOURCE_COUNT = 6;
-const FORCED_MATCH_COUNT = 4;
+const DEFAULT_MATCH_COUNT = 6;
+const DEFAULT_SOURCE_COUNT = 4;
+const FORCED_MATCH_COUNT = 3;
 const MIN_CONTENT_CHARS = 30;
-const KEYWORD_FALLBACK_COUNT = 12;
-const KEYWORD_QUERY_LIMIT = 50;
+const KEYWORD_FALLBACK_COUNT = 8;
+const KEYWORD_QUERY_LIMIT = 30;
 
 function isUsefulChunk(chunk: KnowledgeChunk) {
   // 第一版先做一个很朴素的质量过滤：
