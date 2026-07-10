@@ -444,6 +444,8 @@ export async function POST(request: Request) {
         view_name,
         image_url,
         thumbnail_url,
+        storage_path,
+        thumbnail_storage_path,
         sort_order,
         metadata
       )
@@ -454,10 +456,12 @@ export async function POST(request: Request) {
         ${generatedRender.renderRow.view_name},
         ${generatedRender.renderRow.image_url},
         ${generatedRender.renderRow.thumbnail_url},
+        ${generatedRender.renderRow.metadata.storage_path},
+        ${generatedRender.renderRow.metadata.storage_path},
         ${generatedRender.renderRow.sort_order},
         ${sql.json(generatedRender.renderRow.metadata)}
       )
-      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at
+      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,storage_path,thumbnail_storage_path,sort_order,created_at
     `;
 
     const responsePayload = {

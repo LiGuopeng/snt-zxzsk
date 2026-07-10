@@ -204,6 +204,8 @@ export async function POST(request: Request, context: RouteContext) {
         view_name,
         image_url,
         thumbnail_url,
+        storage_path,
+        thumbnail_storage_path,
         sort_order,
         metadata
       )
@@ -214,6 +216,8 @@ export async function POST(request: Request, context: RouteContext) {
         ${viewName},
         ${uploadedImage.publicUrl},
         ${uploadedImage.publicUrl},
+        ${uploadedImage.storagePath},
+        ${uploadedImage.storagePath},
         ${typeof maxRender?.sort_order === "number" ? maxRender.sort_order + 1 : 1},
         ${sql.json({
           source: "dashscope_image_generation",
@@ -222,7 +226,7 @@ export async function POST(request: Request, context: RouteContext) {
           space_type: spaceType,
         })}
       )
-      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,sort_order,created_at
+      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,storage_path,thumbnail_storage_path,sort_order,created_at
     `;
 
     return NextResponse.json({
