@@ -95,6 +95,10 @@ const EXAMPLE_QUESTIONS = [
 
 // 本地占位会话 ID：用户点击“新对话”后，真实 sessionId 可能还在创建或等待第一条消息。
 const NEW_CHAT_ID = "__new_chat__";
+// 前端打字机每次吐出的字符数。线上 token 合并很快时，用它稳定用户看到的流式节奏。
+const STREAM_TYPEWRITER_CHARS_PER_TICK = 3;
+// 前端打字机间隔。数值越小越快，越大越有逐字感。
+const STREAM_TYPEWRITER_INTERVAL_MS = 24;
 
 /**
  * 创建前端临时消息 ID。
@@ -280,6 +284,128 @@ export default function Home() {
     const requestConversationKey = requestSessionId || NEW_CHAT_ID;
     // 后端可能为新对话创建真实 sessionId，请求结束时用它清理阶段文案。
     let responseSessionId: string | null = null;
+    // 服务端 token 可能一次到很多，先进入本地缓冲，再按固定节奏渲染。
+    let tokenBuffer = "";
+    // 已经渲染到 assistant 消息里的完整文本，用于 done 时补齐差量。
+    let renderedAnswer = "";
+    // 打字机定时器 ID。请求结束或失败时必须清理，避免旧请求继续写 UI。
+    let typewriterTimer: number | null = null;
+    // done 事件需要等待缓冲吐完后再设置 sources，避免完整答案瞬间覆盖流式效果。
+    let typewriterDrainResolver: (() => void) | null = null;
+
+    /**
+     * 判断当前流式事件是否仍应该写入页面。
+     * 新会话流式过程中，前端会从占位会话切换到后端真实 sessionId；
+     * 因此这里同时允许“请求发起时的会话”和“后端返回的真实会话”。
+     */
+    function isRequestConversationStillVisible() {
+      const currentConversationId = activeConversationIdRef.current;
+
+      return (
+        currentConversationId === requestActiveConversationId ||
+        (responseSessionId !== null && currentConversationId === responseSessionId)
+      );
+    }
+
+    /**
+     * 把一段文本追加到助手占位消息。
+     * 所有 token 和 done 补齐文本都走这里，避免多处 setMessages 逻辑不一致。
+     */
+    function appendAssistantText(text: string) {
+      if (!text || !isRequestConversationStillVisible()) {
+        return;
+      }
+
+      renderedAnswer += text;
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === assistantMessageId
+            ? {
+                ...message,
+                content: `${message.content}${text}`,
+              }
+            : message,
+        ),
+      );
+    }
+
+    /**
+     * 启动前端打字机。
+     * 目的不是伪造流式，而是把线上被合并的大块 token 稳定拆成可感知的输出节奏。
+     */
+    function startTypewriter() {
+      if (typewriterTimer) {
+        return;
+      }
+
+      const tick = () => {
+        if (!isRequestConversationStillVisible()) {
+          typewriterTimer = null;
+          tokenBuffer = "";
+          typewriterDrainResolver?.();
+          typewriterDrainResolver = null;
+          return;
+        }
+
+        const nextText = tokenBuffer.slice(0, STREAM_TYPEWRITER_CHARS_PER_TICK);
+        tokenBuffer = tokenBuffer.slice(STREAM_TYPEWRITER_CHARS_PER_TICK);
+        appendAssistantText(nextText);
+
+        if (tokenBuffer.length > 0) {
+          typewriterTimer = window.setTimeout(tick, STREAM_TYPEWRITER_INTERVAL_MS);
+          return;
+        }
+
+        typewriterTimer = null;
+        typewriterDrainResolver?.();
+        typewriterDrainResolver = null;
+      };
+
+      typewriterTimer = window.setTimeout(tick, STREAM_TYPEWRITER_INTERVAL_MS);
+    }
+
+    /**
+     * 把新到的 token 放入本地缓冲。
+     * 即使后端或代理一次性给出大段文本，UI 仍会按固定速度显示。
+     */
+    function enqueueAssistantText(text: string) {
+      if (!text || !isRequestConversationStillVisible()) {
+        return;
+      }
+
+      tokenBuffer += text;
+      startTypewriter();
+    }
+
+    /**
+     * 等待本地 token 缓冲渲染完成。
+     * done 事件使用它来避免完整 answer 立刻覆盖正在打字的内容。
+     */
+    function waitForTypewriterDrain() {
+      if (!tokenBuffer && !typewriterTimer) {
+        return Promise.resolve();
+      }
+
+      return new Promise<void>((resolve) => {
+        typewriterDrainResolver = resolve;
+        startTypewriter();
+      });
+    }
+
+    /**
+     * 清理本次请求的打字机定时器。
+     * 防止请求失败、切换会话或组件重新提交后，旧 timer 继续写入页面。
+     */
+    function stopTypewriter() {
+      if (typewriterTimer) {
+        window.clearTimeout(typewriterTimer);
+        typewriterTimer = null;
+      }
+
+      tokenBuffer = "";
+      typewriterDrainResolver?.();
+      typewriterDrainResolver = null;
+    }
 
     if (!question || loadingConversationIds.includes(requestConversationKey)) {
       return;
@@ -384,33 +510,33 @@ export default function Home() {
           const payload = parsed.data as ChatStreamTokenPayload | null;
           const token = payload?.token || "";
 
-          if (!token || activeConversationIdRef.current !== requestActiveConversationId) {
+          if (!token || !isRequestConversationStillVisible()) {
             return;
           }
 
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === assistantMessageId
-                ? {
-                    ...message,
-                    content: `${message.content}${token}`,
-                  }
-                : message,
-            ),
-          );
+          enqueueAssistantText(token);
           return;
         }
 
         if (parsed.event === "done") {
           const payload = parsed.data as ChatStreamDonePayload | null;
+          const finalAnswer = payload?.answer || "";
 
-          if (activeConversationIdRef.current === requestActiveConversationId) {
+          if (isRequestConversationStillVisible()) {
+            if (finalAnswer && finalAnswer.startsWith(renderedAnswer)) {
+              enqueueAssistantText(finalAnswer.slice(renderedAnswer.length));
+            } else if (finalAnswer && !renderedAnswer) {
+              enqueueAssistantText(finalAnswer);
+            }
+
+            await waitForTypewriterDrain();
+
             setMessages((current) =>
               current.map((message) =>
                 message.id === assistantMessageId
                   ? {
                       ...message,
-                      content: payload?.answer || message.content,
+                      content: finalAnswer || message.content,
                       sources: payload?.sources || [],
                     }
                   : message,
@@ -460,6 +586,7 @@ export default function Home() {
         setMessages((current) => current.filter((message) => message.id !== assistantMessageId));
       }
     } finally {
+      stopTypewriter();
       setLoadingConversationIds((current) =>
         current.filter((conversationId) => conversationId !== requestConversationKey),
       );
