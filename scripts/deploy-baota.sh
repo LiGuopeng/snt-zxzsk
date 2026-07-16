@@ -8,6 +8,50 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/www/snt-zxzsk}"
 WEB_DIR="$PROJECT_DIR/apps/web"
 PM2_NAME="${PM2_NAME:-snt-zxzsk-web}"
+# PSQL_BIN 允许临时指定 psql 路径，例如：
+#   PSQL_BIN=/www/server/pgsql/bin/psql bash scripts/deploy-baota.sh
+# 宝塔安装 PostgreSQL 时，psql 不一定在系统 PATH 里，所以脚本会额外扫描常见安装目录。
+PSQL_BIN="${PSQL_BIN:-}"
+
+ensure_psql_client() {
+  # 数据库建表和验证都依赖 PostgreSQL 客户端 psql。
+  # 这里不要求服务器必须安装完整 PostgreSQL 服务，只需要能执行 psql 命令即可。
+  if [ -n "$PSQL_BIN" ] && [ -x "$PSQL_BIN" ]; then
+    echo "$PSQL_BIN"
+    return 0
+  fi
+
+  if command -v psql >/dev/null 2>&1; then
+    command -v psql
+    return 0
+  fi
+
+  # 宝塔 PostgreSQL 插件常见路径；如果插件已装但 PATH 没配，这里可以直接复用。
+  for candidate in \
+    /www/server/pgsql/bin/psql \
+    /www/server/postgresql/bin/psql \
+    /usr/pgsql-16/bin/psql \
+    /usr/pgsql-15/bin/psql \
+    /usr/pgsql-14/bin/psql \
+    /usr/bin/psql; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  echo "psql command not found." >&2
+  echo "Please install PostgreSQL client first, then rerun this script." >&2
+  echo "" >&2
+  echo "Alibaba/CentOS/RHEL usually:" >&2
+  echo "  yum install -y postgresql" >&2
+  echo "or:" >&2
+  echo "  dnf install -y postgresql" >&2
+  echo "" >&2
+  echo "If PostgreSQL was installed by BaoTa, try:" >&2
+  echo "  PSQL_BIN=/www/server/pgsql/bin/psql bash scripts/deploy-baota.sh" >&2
+  return 1
+}
 
 echo "=== 1. check project directory ==="
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -51,9 +95,13 @@ fi
 echo "=== 6. ensure database schema ==="
 cd "$PROJECT_DIR"
 
+# 先定位 psql，避免服务器未安装客户端时直接报 command not found。
+PSQL_CMD="$(ensure_psql_client)"
+echo "Using psql: $PSQL_CMD"
+
 # 两个 SQL 都使用 create table if not exists / create index if not exists，可重复执行，不会清空已有数据。
-psql "$DATABASE_URL" -f "$PROJECT_DIR/infra/postgres/schema.sql"
-psql "$DATABASE_URL" -f "$PROJECT_DIR/infra/postgres/design-render-schema.sql"
+"$PSQL_CMD" "$DATABASE_URL" -f "$PROJECT_DIR/infra/postgres/schema.sql"
+"$PSQL_CMD" "$DATABASE_URL" -f "$PROJECT_DIR/infra/postgres/design-render-schema.sql"
 
 echo "=== 7. build Next.js app ==="
 cd "$WEB_DIR"
@@ -77,7 +125,7 @@ curl -fsS --max-time 15 http://127.0.0.1:3000/api/health/knowledge
 echo
 
 echo "=== 11. verify design tables ==="
-psql "$DATABASE_URL" -c "
+"$PSQL_CMD" "$DATABASE_URL" -c "
 select table_name
 from information_schema.tables
 where table_schema = 'public'
