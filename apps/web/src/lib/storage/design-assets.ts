@@ -2,7 +2,11 @@ import { randomUUID } from "crypto";
 import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import path from "path";
 
-const UPLOAD_ROOT = path.join(process.cwd(), "public", "uploads", "design-assets");
+// DESIGN_ASSET_ROOT 用于线上固定图片落盘目录，避免 PM2 cwd 不一致时把图片写到错误位置。
+// 默认仍兼容本地开发：apps/web 目录下启动时会写入 apps/web/public/uploads/design-assets。
+const UPLOAD_ROOT = process.env.DESIGN_ASSET_ROOT
+  ? path.resolve(process.env.DESIGN_ASSET_ROOT)
+  : path.join(process.cwd(), "public", "uploads", "design-assets");
 const PUBLIC_PREFIX = "/uploads/design-assets";
 
 export function sanitizeFileName(fileName: string) {

@@ -8,6 +8,8 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/www/snt-zxzsk}"
 WEB_DIR="$PROJECT_DIR/apps/web"
 PM2_NAME="${PM2_NAME:-snt-zxzsk-web}"
+APP_PORT="${APP_PORT:-3000}"
+DESIGN_ASSET_ROOT="${DESIGN_ASSET_ROOT:-$WEB_DIR/public/uploads/design-assets}"
 # PSQL_BIN 允许临时指定 psql 路径，例如：
 #   PSQL_BIN=/www/server/pgsql/bin/psql bash scripts/deploy-baota.sh
 # 宝塔安装 PostgreSQL 时，psql 不一定在系统 PATH 里，所以脚本会额外扫描常见安装目录。
@@ -108,8 +110,11 @@ cd "$WEB_DIR"
 pnpm build
 
 echo "=== 8. ensure upload directory writable ==="
-mkdir -p "$WEB_DIR/public/uploads"
+mkdir -p "$DESIGN_ASSET_ROOT"
 chmod -R 755 "$WEB_DIR/public/uploads"
+
+# 固定图片落盘目录，避免 PM2 工作目录不是 apps/web 时把生成图写到 /www/snt-zxzsk/public/uploads。
+export DESIGN_ASSET_ROOT
 
 echo "=== 9. restart pm2 service ==="
 if pm2 describe "$PM2_NAME" >/dev/null 2>&1; then
@@ -121,10 +126,20 @@ fi
 pm2 save
 
 echo "=== 10. verify local health endpoint ==="
-curl -fsS --max-time 15 http://127.0.0.1:3000/api/health/knowledge
+curl -fsS --max-time 15 "http://127.0.0.1:$APP_PORT/api/health/knowledge"
 echo
 
-echo "=== 11. verify design tables ==="
+echo "=== 11. verify upload static route ==="
+echo "ok" > "$WEB_DIR/public/uploads/.deploy-check.txt"
+if curl -fsS --max-time 15 "http://127.0.0.1:$APP_PORT/uploads/.deploy-check.txt" >/dev/null; then
+  echo "uploads static route ok"
+else
+  echo "uploads static route failed: please check Next/PM2 cwd or Nginx /uploads proxy/alias"
+  echo "expected file: $WEB_DIR/public/uploads/.deploy-check.txt"
+  exit 1
+fi
+
+echo "=== 12. verify design tables ==="
 "$PSQL_CMD" "$DATABASE_URL" -c "
 select table_name
 from information_schema.tables
