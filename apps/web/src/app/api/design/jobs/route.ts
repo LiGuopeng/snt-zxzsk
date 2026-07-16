@@ -6,17 +6,31 @@ import { generateInteriorDesignImage } from "@/lib/ai/dashscope-images";
 import { createPostgresClient } from "@/lib/db/postgres";
 import { saveDesignAsset } from "@/lib/storage/design-assets";
 
+// 创建全屋覆盖封面图的请求体；所有字段都按 unknown 接收，再通过工具函数做白名单收敛。
 type CreateDesignJobBody = {
   projectId?: unknown;
   floorPlanId?: unknown;
   intentText?: unknown;
+  designPreferences?: unknown;
 };
 
+// 用户生成偏好会同时进入 prompt 和 design_projects.extracted_preferences，后续可复盘生成依据。
+type DesignPreferences = {
+  feeling: string | null;
+  family: string | null;
+  priority: string | null;
+  budget: string | null;
+  custom_text: string | null;
+  intent_text: string | null;
+};
+
+// 户型解析返回的空间结构不完全受控，这里只声明当前生成链路需要的最小字段。
 type ParsedSpace = {
   name?: unknown;
   type?: unknown;
 };
 
+// RenderTarget 是内部生成目标。当前接口只真正生成第一张“全屋覆盖封面图”，其余 target 作为可按需生成空间列表。
 type RenderTarget = {
   spaceName: string;
   viewName: string;
@@ -24,6 +38,7 @@ type RenderTarget = {
   sortOrder: number;
 };
 
+// 生成主图前只读取户型图的必要字段，避免接口和数据库表字段强耦合。
 type FloorPlanForRender = {
   id: string;
   project_id: string;
@@ -34,6 +49,7 @@ type FloorPlanForRender = {
   circulation: string | null;
 };
 
+// design_generation_jobs 的核心返回字段，供前端展示任务状态。
 type DesignJobRow = {
   id: string;
   project_id: string;
@@ -50,6 +66,45 @@ type DesignJobRow = {
 function getStringValue(value: unknown) {
   // API body 是外部输入，先收敛成 string | null，再参与 SQL 查询和 prompt 拼接。
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function parseDesignPreferences(value: unknown, fallbackIntentText: string | null): DesignPreferences {
+  // 兼容旧版本只传 intentText 的情况；没有结构化偏好时使用 fallbackIntentText 兜底。
+  if (!value || typeof value !== "object") {
+    return {
+      feeling: null,
+      family: null,
+      priority: null,
+      budget: null,
+      custom_text: null,
+      intent_text: fallbackIntentText,
+    };
+  }
+
+  const record = value as Record<string, unknown>;
+  const preferences = {
+    feeling: getStringValue(record.feeling),
+    family: getStringValue(record.family),
+    priority: getStringValue(record.priority),
+    budget: getStringValue(record.budget),
+    custom_text: getStringValue(record.custom_text),
+    intent_text: getStringValue(record.intent_text) || fallbackIntentText,
+  };
+
+  return preferences;
+}
+
+function createPreferenceText(preferences: DesignPreferences) {
+  // prompt 中用自然语言描述结构化偏好，模型比读 JSON 更稳定。
+  const lines = [
+    preferences.feeling ? `居住感觉：${preferences.feeling}` : null,
+    preferences.family ? `居住成员：${preferences.family}` : null,
+    preferences.priority ? `重点诉求：${preferences.priority}` : null,
+    preferences.budget ? `预算倾向：${preferences.budget}` : null,
+    preferences.custom_text ? `补充要求：${preferences.custom_text}` : null,
+  ].filter(Boolean);
+
+  return lines.length ? lines.join("；") : preferences.intent_text || "现代简约，明亮通透，耐脏好打理，预算中等";
 }
 
 function normalizeSpaces(spaces: unknown) {
@@ -155,6 +210,7 @@ const SPACE_PROMPT_FOCUS: Record<string, string> = {
 };
 
 function createRenderTargets(spaces: unknown): RenderTarget[] {
+  // 即使当前只生成全屋主图，也先构造完整空间列表，供 response_payload 和右侧按钮使用。
   const uniqueSpaces = new Map<string, { name: string; type: string; normalizedType: string }>();
 
   // 同一类空间只生成一个入口，避免“卧室/次卧/Bedroom”重复挤满结果列表。
@@ -188,12 +244,16 @@ function createRenderTargets(spaces: unknown): RenderTarget[] {
     throw new Error("户型解析结果没有可生成的空间，请重新解析户型图后再生成效果图");
   }
 
+  // 第一张图要“正式全屋覆盖”，但真实室内单镜头天然无法同时看到所有房间。
+  // 所以这里把解析出的主要空间收敛成封面图覆盖清单，让模型生成同一风格下的多分镜真实效果图。
+  const coverSpaceNames = spaceTargets.map((target) => target.spaceName).slice(0, 8).join("、");
+
   return [
-    // 第一张必须是全屋主图：先让用户快速看到总体方案，再按需补单个空间，减少一次性等待时间。
+    // 第一张是全屋覆盖封面图：用多分镜真实效果覆盖主要空间，不再用单个客餐厅镜头冒充全屋。
     {
       spaceName: "全屋",
-      viewName: "全屋效果图",
-      promptFocus: "重点展示全屋统一风格、客餐厅与相邻空间的整体关系、主要家具搭配、灯光氛围和空间动线。",
+      viewName: "全屋覆盖封面图",
+      promptFocus: `一张图内以多分镜覆盖解析出的主要空间：${coverSpaceNames}。每个分镜都必须是真实装修后的室内效果图，并保持同一套风格、材质、色系、灯光和家具语言。`,
       sortOrder: 0,
     },
     ...spaceTargets,
@@ -202,6 +262,7 @@ function createRenderTargets(spaces: unknown): RenderTarget[] {
 
 function buildPrompt(
   intentText: string | null,
+  preferences: DesignPreferences,
   floorPlan: {
     house_type: string | null;
     area: number | null;
@@ -211,22 +272,28 @@ function buildPrompt(
   target: RenderTarget,
 ) {
   if (target.spaceName === "全屋") {
-    // 全屋图要求 3D 轴测/俯视总览，重点是户型关系完整，不是单个房间摄影图。
+    // 全屋覆盖封面图用“多分镜真实室内图”解决覆盖问题：
+    // 既能让第一张图覆盖全屋主要空间，又避免退化成户型图、模型图或俯视结构图。
     return [
-      "根据用户上传的户型图，生成一张三维俯视/轴测视角的全屋装修效果图。",
-      "固定默认风格：现代简约、明亮通透、暖白与浅木色为主、真实家具软装、干净耐看的家装产品质感。",
-      "画面必须像建筑室内可视化模型：完整户型全部入镜，所有主要房间同时可见，墙体、门洞、窗洞、地面、家具、灯光、软装、厨卫和阳台关系清楚。",
-      "视角要求：bird's-eye view, isometric interior render, 3D cutaway apartment visualization, top-down whole-home furnished model。",
-      "请严格参考户型解析结果保持空间数量、空间邻接关系、动线和面积比例，不要把户型改成单个房间。",
-      "不要生成普通客厅照片，不要生成单空间局部图，不要生成平面户型图，不要生成 2D 图纸，不要生成手绘图，不要生成施工图。",
+      "根据用户上传的户型图和解析结果，生成一张装修完成后的真实全屋覆盖封面图。",
+      "这不是单个房间镜头，而是一张室内设计作品集封面式多分镜图。",
+      "同一张图片中必须用多个真实摄影级室内分镜覆盖解析出的主要空间，例如客厅/餐厅公共区、主卧、次卧或儿童房、厨房、卫生间、阳台或书房。",
+      "每个分镜都必须像真实装修效果图，有真实家具、灯具、墙面、地面、柜体、软装和居住尺度。",
+      "所有分镜必须保持同一套装修风格、材质、色系、灯光和家具语言，让用户能看出这是同一个家的完整方案。",
+      "默认风格：现代轻奢、明亮通透、暖白墙面、浅米色软装、深色木地板或木饰面、拱形门洞/壁龛、嵌入式灯带、真实家具软装、干净耐看的家装产品质感。",
+      "画面质量：photorealistic interior rendering, interior design portfolio cover, multi-panel realistic home render, cinematic lighting, realistic materials, soft shadows。",
+      "构图要求：画面可以是 4-6 个整齐分区的真实室内分镜组合，但不要出现文字标题、房间标签、尺寸标注或图纸符号。",
+      "禁止生成户型立体图、俯视轴测图、剖切模型图、dollhouse、平面户型图、2D 图纸、施工图、手绘图、带标签的空间示意图。",
+      "不要只生成客厅或餐厅；如果只出现单个空间，就不符合全屋覆盖封面图要求。",
       `当前生成目标：${target.spaceName} · ${target.viewName}`,
       `画面重点：${target.promptFocus}`,
       `户型：${floorPlan.house_type || "未识别"}`,
       `面积：${floorPlan.area ? `${floorPlan.area} 平方米` : "未识别"}`,
       `空间：${createSpacesText(floorPlan.spaces)}`,
       `动线：${floorPlan.circulation || "未识别"}`,
-      `用户补充需求：${intentText || "无补充，使用固定默认风格"}`,
-      "最终输出只能是一张完整全屋三维总览效果图。",
+      `结构化偏好：${createPreferenceText(preferences)}`,
+      `用户补充需求：${intentText || preferences.intent_text || "无补充，使用固定默认风格"}`,
+      "最终输出只能是一张真实装修后的全屋覆盖封面图：既要覆盖主要空间，也必须真实、可落地、像室内摄影或高质量效果图。",
     ].join("\n");
   }
 
@@ -242,7 +309,8 @@ function buildPrompt(
     `面积：${floorPlan.area ? `${floorPlan.area} 平方米` : "未识别"}`,
     `空间：${createSpacesText(floorPlan.spaces)}`,
     `动线：${floorPlan.circulation || "未识别"}`,
-    `用户需求：${intentText || "现代简约，明亮通透，耐脏好打理，预算中等"}`,
+    `结构化偏好：${createPreferenceText(preferences)}`,
+    `用户需求：${intentText || preferences.intent_text || "现代简约，明亮通透，耐脏好打理，预算中等"}`,
     target.spaceName === "全屋"
       ? "输出必须是一张全屋装修效果图，不能只展示单个局部角落。"
       : `输出必须聚焦${target.spaceName}，但风格、材质和色系统一于全屋方案。`,
@@ -299,11 +367,14 @@ async function generateRenderForTarget(params: {
     circulation: string | null;
   };
   intentText: string | null;
+  preferences: DesignPreferences;
   jobId: string;
   projectId: string;
   target: RenderTarget;
 }) {
-  const targetPrompt = buildPrompt(params.intentText, params.floorPlan, params.target);
+  // 一个 target 对应一次真实 DashScope 生图 + 一条 design_renders 记录。
+  // 当前主接口只调用一次，空间图改由 /jobs/[id]/spaces 手动按需生成。
+  const targetPrompt = buildPrompt(params.intentText, params.preferences, params.floorPlan, params.target);
   // 这里调用真实 DashScope 生图服务，生成完成后下载图片并转存到本地 public/uploads。
   const generatedImage = await generateInteriorDesignImage(targetPrompt);
   const uploadedImage = await uploadGeneratedImage({
@@ -326,6 +397,9 @@ async function generateRenderForTarget(params: {
         task_id: generatedImage.taskId,
         storage_path: uploadedImage.storagePath,
         prompt_focus: params.target.promptFocus,
+        render_role: params.target.spaceName === "全屋" ? "whole_home_cover" : "space_derived",
+        render_mode: "2d",
+        design_preferences: params.preferences,
       },
     },
     task: {
@@ -346,6 +420,7 @@ export async function POST(request: Request) {
     const projectId = getStringValue(body?.projectId);
     const floorPlanId = getStringValue(body?.floorPlanId);
     const intentText = getStringValue(body?.intentText);
+    const designPreferences = parseDesignPreferences(body?.designPreferences, intentText);
 
     if (!projectId || !floorPlanId) {
       return NextResponse.json(
@@ -380,7 +455,7 @@ export async function POST(request: Request) {
       return NextResponse.json(
         {
           ok: false,
-          error: "户型图解析完成后才能生成全屋效果图",
+          error: "户型图解析完成后才能生成全屋覆盖封面图",
         },
         { status: 400 },
       );
@@ -390,7 +465,7 @@ export async function POST(request: Request) {
     const wholeHomeTarget = renderTargets[0];
     // 任务 prompt 保存的是本次生成概要，单张图片的完整 prompt 写入 DashScope 请求和 render metadata。
     const prompt = [
-      "全屋效果图生成任务。",
+      "全屋覆盖封面图生成任务。",
       `本次先生成主图：${wholeHomeTarget.spaceName} · ${wholeHomeTarget.viewName}`,
       `可选空间：${renderTargets
         .slice(1)
@@ -399,12 +474,16 @@ export async function POST(request: Request) {
       `户型：${floorPlan.house_type || "未识别"}`,
       `面积：${floorPlan.area ? `${floorPlan.area} 平方米` : "未识别"}`,
       `空间：${createSpacesText(floorPlan.spaces)}`,
-      `用户需求：${intentText || "现代简约，明亮通透，耐脏好打理，预算中等"}`,
+      `结构化偏好：${createPreferenceText(designPreferences)}`,
+      `用户需求：${intentText || designPreferences.intent_text || "现代简约，明亮通透，耐脏好打理，预算中等"}`,
     ].join("\n");
 
     await sql`
       update public.design_projects
-      set status = 'generating', intent_text = ${intentText}, updated_at = now()
+      set status = 'generating',
+          intent_text = ${intentText || designPreferences.intent_text},
+          extracted_preferences = ${sql.json(designPreferences)},
+          updated_at = now()
       where id = ${projectId}
     `;
 
@@ -418,6 +497,7 @@ export async function POST(request: Request) {
         prompt,
         provider,
         model,
+        request_payload,
         started_at,
         updated_at
       )
@@ -429,16 +509,22 @@ export async function POST(request: Request) {
         ${prompt},
         'dashscope',
         ${process.env.DASHSCOPE_IMAGE_MODEL || "wan2.7-image"},
+        ${sql.json({
+          intent_text: intentText || designPreferences.intent_text,
+          design_preferences: designPreferences,
+          floor_plan_id: floorPlanId,
+        })},
         now(),
         now()
       )
       returning id,project_id,floor_plan_id,status,progress,prompt,provider,model,created_at,updated_at
     `;
 
-    // 创建任务接口只生成全屋主图；各空间图由 /spaces 接口按用户点击再生成，避免首屏等待过长。
+    // 创建任务接口只生成第一张全屋覆盖封面图；空间图由用户在右侧点击某个空间后按需生成。
     const generatedRender = await generateRenderForTarget({
       floorPlan,
       intentText,
+      preferences: designPreferences,
       jobId: job.id,
       projectId,
       target: wholeHomeTarget,
@@ -469,18 +555,19 @@ export async function POST(request: Request) {
         ${generatedRender.renderRow.sort_order},
         ${sql.json(generatedRender.renderRow.metadata)}
       )
-      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,storage_path,thumbnail_storage_path,sort_order,created_at
+      returning id,project_id,job_id,space_name,view_name,image_url,thumbnail_url,storage_path,thumbnail_storage_path,sort_order,metadata,created_at
     `;
 
     const responsePayload = {
       provider: "dashscope",
       primary_render: generatedRender.task,
-      // available_spaces 给前端渲染“可继续生成”的空间按钮，不代表这些图片已经生成。
+      // available_spaces 给前端渲染“可继续生成”的空间按钮，不代表这些图片已经生成，也不会触发自动批量生图。
       available_spaces: renderTargets.slice(1).map((target) => ({
         space_name: target.spaceName,
         view_name: target.viewName,
         sort_order: target.sortOrder,
       })),
+      design_preferences: designPreferences,
     };
     const [completedJob] = await sql`
       update public.design_generation_jobs

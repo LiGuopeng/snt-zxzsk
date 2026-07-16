@@ -8,7 +8,9 @@ import {
   saveDesignAsset,
 } from "@/lib/storage/design-assets";
 
+// 上传大小限制和前端保持一致；后端校验是最终防线，不能只依赖浏览器校验。
 const MAX_FILE_SIZE = 15 * 1024 * 1024;
+// 允许 PDF 是为了兼容真实交付场景，很多户型图会以 PDF 图纸形式给到用户。
 const ALLOWED_FILE_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -66,9 +68,10 @@ export async function POST(request: Request) {
     }
 
     const sql = createPostgresClient();
+    // intentText 是用户在上传前已经填写的装修偏好，会先挂到 project 上，后续生图时继续使用。
     const intentText = getStringField(formData, "intentText");
 
-    // 每次上传户型图都先创建一个项目，后续解析结果、全屋主图和空间图都挂在这个 project 下。
+    // 每次上传户型图都先创建一个项目，后续解析结果、全屋覆盖封面图和空间图都挂在这个 project 下。
     const [project] = await sql`
       insert into public.design_projects (title, status, intent_text, updated_at)
       values ('全屋效果图方案', 'uploaded', ${intentText}, now())
@@ -76,6 +79,7 @@ export async function POST(request: Request) {
     `;
 
     const safeName = sanitizeFileName(file.name || "floor-plan");
+    // File.arrayBuffer() 只能读一次，所以先转成 Buffer，再交给统一的本地存储工具。
     const fileBuffer = Buffer.from(await file.arrayBuffer());
     // 户型原图保存到本地文件目录，PostgreSQL 只记录 file_url/storage_path，避免数据库存大文件。
     const uploaded = await saveDesignAsset({
