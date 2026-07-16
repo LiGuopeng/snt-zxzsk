@@ -171,7 +171,7 @@ export default function Home() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   // 当前中间聊天窗口展示的消息。
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  // 当前主工作区：AI 装修顾问或效果图生成。
+  // 当前主工作区：AI 装修顾问或装修方案。
   const [activeWorkspace, setActiveWorkspace] = useState<"chat" | "design">("design");
   // 当前选中的真实会话 ID；NEW_CHAT_ID 表示前端新对话占位。
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
@@ -700,7 +700,7 @@ export default function Home() {
           <nav className="mt-7 space-y-1 px-3">
             {[
               ["chat", "AI装修顾问"],
-              ["design", "效果图生成"],
+              ["design", "装修方案"],
             ].map(([key, label]) => (
               <button
                 className={
@@ -805,11 +805,11 @@ export default function Home() {
           <header className="flex h-[72px] shrink-0 items-center justify-between border-b border-[#dbe5f3] bg-white px-4 md:px-7">
             <div>
               <h1 className="text-2xl font-semibold tracking-normal text-[#111827]">
-                {activeWorkspace === "design" ? "效果图生成" : "AI装修顾问"}
+                {activeWorkspace === "design" ? "装修方案" : "AI装修顾问"}
               </h1>
               <div className="mt-1 text-sm text-[#6b7894]">
                 {activeWorkspace === "design"
-                  ? "上传户型图，生成统一风格的全屋效果图方案"
+                  ? "上传户型图，生成效果图、水电点位、方案预算和避坑提醒"
                   : "基于装修知识库回答施工、材料、预算、验收问题"}
               </div>
             </div>

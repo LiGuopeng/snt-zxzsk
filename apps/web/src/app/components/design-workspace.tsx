@@ -2,6 +2,15 @@
 
 import { ChangeEvent, useRef, useState } from "react";
 
+import {
+  BudgetPlanPanel,
+  HydropowerPlanPanel,
+  PlanTabNav,
+  PlanUploadRequiredPanel,
+  RiskReminderPanel,
+  type PlanTab,
+} from "./design-plan-tabs";
+
 // 右侧“输出”模块展示的是效果图能力边界，不参与接口参数计算。
 const DEFAULT_OUTPUTS = ["2D真实效果图", "3D立体效果图", "统一风格", "放大预览"];
 // 户型图上传大小限制要和后端保持一致，避免前端放过、后端拒绝造成体验割裂。
@@ -354,6 +363,8 @@ export function DesignWorkspace() {
   const [renders, setRenders] = useState<DesignRender[]>([]);
   // activeRenderMode 决定主图区域展示哪一类图，也决定右侧空间按钮生成 2D 还是 3D。
   const [activeRenderMode, setActiveRenderMode] = useState<RenderMode>("2d");
+  // activePlanTab 决定“装修方案”里的一级 Tab：效果图、水电点位、方案预算、避坑提醒。
+  const [activePlanTab, setActivePlanTab] = useState<PlanTab>("renders");
   // activeRenderId 只在当前模式内生效；切换 2D/3D 时会自动定位该模式第一张图。
   const [activeRenderId, setActiveRenderId] = useState<string | null>(null);
   // previewRender 控制效果图放大弹窗；户型立体结构图使用单独的 structurePreviewOpen，避免两个模块混用。
@@ -367,6 +378,9 @@ export function DesignWorkspace() {
   const [generatingSpaceKey, setGeneratingSpaceKey] = useState<string | null>(null);
 
   const hasFloorPlan = Boolean(floorPlan);
+  // hasUploadedFloorPlan 专门控制“水电位图”和“方案预算”的准入。
+  // 这两个模块必须基于用户真实上传的户型图，不能再展示前端兜底样例。
+  const hasUploadedFloorPlan = Boolean(floorPlan?.id || floorPlan?.file_url);
   const analysisCompleted = floorPlan?.analysis_status === "completed";
   const analysisFailed = floorPlan?.analysis_status === "failed";
   const uploadStatusLabel = uploading
@@ -591,6 +605,15 @@ export function DesignWorkspace() {
 
     setActiveRenderMode(mode);
     setActiveRenderId(firstRenderInMode?.id || null);
+  }
+
+  function switchPlanTab(tab: PlanTab) {
+    // 水电位图和方案预算依赖户型图上传结果；未上传前不允许切入，避免用户看到伪造明细。
+    if (!hasUploadedFloorPlan && (tab === "hydropower" || tab === "budget")) {
+      return;
+    }
+
+    setActivePlanTab(tab);
   }
 
   function openRenderPreview(render: DesignRender) {
@@ -1070,10 +1093,13 @@ export function DesignWorkspace() {
           </div>
         </section>
 
+        <PlanTabNav activeTab={activePlanTab} hasUploadedFloorPlan={hasUploadedFloorPlan} onChange={switchPlanTab} />
+
+        {activePlanTab === "renders" ? (
         <section className="rounded-lg border border-[#d9e4f7] bg-white p-4 shadow-[0_10px_30px_rgba(22,56,117,0.06)]">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 className="text-base font-semibold text-[#17233f]">全屋效果图方案</h2>
+              <h2 className="text-base font-semibold text-[#17233f]">效果图</h2>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <span className="font-semibold text-[#17233f]">
                   {generating && activeRender
@@ -1290,86 +1316,43 @@ export function DesignWorkspace() {
           </div>
 
         </section>
+        ) : null}
 
-        <section className="rounded-lg border border-[#d9e4f7] bg-white p-4 shadow-[0_10px_30px_rgba(22,56,117,0.06)]">
-          <div className="mb-4">
-            <div className="text-base font-semibold text-[#17233f]">户型诊断</div>
-            <div className="mt-1 text-xs text-[#7d8aa6]">
-              基于户型图解析结果展示动线、面积、门窗、采光和结构边界信息。
-            </div>
-          </div>
+        {activePlanTab === "hydropower" ? (
+          hasUploadedFloorPlan ? (
+            <HydropowerPlanPanel floorPlan={floorPlan} />
+          ) : (
+            <PlanUploadRequiredPanel moduleName="水电位图" />
+          )
+        ) : null}
 
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <div className="rounded-lg border border-[#d9e4f7] bg-[#f8fbff] p-3">
-              <div className="text-xs font-semibold text-[#0969ff]">动线</div>
-              <div className="mt-2 text-sm leading-6 text-[#17233f]">
-                {getTextValue(circulationAnalysis.summary, floorPlan?.circulation || "待解析后生成")}
-              </div>
-              {circulationIssues.length ? (
-                <div className="mt-2 space-y-1 text-xs leading-5 text-[#667799]">
-                  {circulationIssues.slice(0, 2).map((issue) => (
-                    <div key={issue}>- {issue}</div>
-                  ))}
-                </div>
-              ) : null}
-            </div>
+        {activePlanTab === "budget" ? (
+          hasUploadedFloorPlan ? (
+            <BudgetPlanPanel floorPlan={floorPlan} hasRender={renders.length > 0} preferences={designPreferences} />
+          ) : (
+            <PlanUploadRequiredPanel moduleName="方案预算" />
+          )
+        ) : null}
 
-            <div className="rounded-lg border border-[#d9e4f7] bg-[#f8fbff] p-3">
-              <div className="text-xs font-semibold text-[#0969ff]">面积</div>
-              <div className="mt-2 text-sm leading-6 text-[#17233f]">
-                {getTextValue(areaRatioAnalysis.summary, floorPlan?.area ? `${floorPlan.area} 平，待进一步分析比例` : "待解析后生成")}
-              </div>
-              {potentialWaste.length ? (
-                <div className="mt-2 space-y-1 text-xs leading-5 text-[#667799]">
-                  {potentialWaste.slice(0, 2).map((item) => (
-                    <div key={item}>- {item}</div>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-
-            <div className="rounded-lg border border-[#d9e4f7] bg-[#f8fbff] p-3">
-              <div className="text-xs font-semibold text-[#0969ff]">门窗采光</div>
-              <div className="mt-2 text-sm leading-6 text-[#17233f]">
-                {floorPlan?.analysis_result
-                  ? `${doors.length} 个门位，${windows.length} 个窗位`
-                  : "待解析后生成"}
-              </div>
-              <div className="mt-2 text-xs leading-5 text-[#667799]">
-                {floorPlan?.analysis_result
-                  ? getTextValue(floorPlan.analysis_result.orientation, "朝向或采光未明确")
-                  : "上传户型图后识别门窗和采光"}
-              </div>
-            </div>
-
-            <div className="rounded-lg border border-[#d9e4f7] bg-[#fffafb] p-3">
-              <div className="text-xs font-semibold text-[#ef3349]">结构边界</div>
-              <div className="mt-2 text-sm leading-6 text-[#17233f]">
-                {structureRiskWarnings[0] || "承重墙、梁柱需结构图确认"}
-              </div>
-              <div className="mt-2 text-xs leading-5 text-[#667799]">
-                AI 仅做疑似识别，不能替代物业审批和专业结构判断。
-              </div>
-            </div>
-          </div>
-
-          {areaSuggestions.length ? (
-            <div className="mt-3 rounded-lg border border-[#d9e4f7] bg-white p-3">
-              <div className="text-xs font-semibold text-[#42557d]">优化建议</div>
-              <div className="mt-2 grid gap-2 text-xs leading-5 text-[#667799] md:grid-cols-2">
-                {areaSuggestions.slice(0, 4).map((suggestion) => (
-                  <div className="rounded-md bg-[#f8fbff] px-3 py-2" key={suggestion}>
-                    {suggestion}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </section>
+        {activePlanTab === "risks" ? (
+          <RiskReminderPanel
+            areaSuggestions={areaSuggestions}
+            areaSummary={getTextValue(
+              areaRatioAnalysis.summary,
+              floorPlan?.area ? `${floorPlan.area} 平，待进一步分析比例` : "待解析后生成",
+            )}
+            circulationIssues={circulationIssues}
+            circulationSummary={getTextValue(circulationAnalysis.summary, floorPlan?.circulation || "待解析后生成")}
+            doorsCount={floorPlan?.analysis_result ? doors.length : 0}
+            potentialWaste={potentialWaste}
+            structureRiskWarnings={structureRiskWarnings}
+            windowsCount={floorPlan?.analysis_result ? windows.length : 0}
+          />
+        ) : null}
       </div>
 
       <aside className="flex min-h-0 flex-col gap-4 overflow-y-auto rounded-lg border border-[#d9e4f7] bg-white p-4 shadow-[0_10px_30px_rgba(22,56,117,0.06)]">
-        <h2 className="text-base font-semibold text-[#17233f]">户型解析</h2>
+        <h2 className="text-base font-semibold text-[#17233f]">装修方案助手</h2>
         <div className="border-t border-[#edf2fa] pt-4">
           <div className="mb-3 text-sm font-medium text-[#42557d]">识别结果</div>
           <div className="grid gap-3 text-sm">

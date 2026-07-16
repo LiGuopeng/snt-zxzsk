@@ -96,6 +96,19 @@ function encodeEvent(event: string, data: unknown) {
 }
 
 /**
+ * 返回 JSON 错误响应。
+ * 这里不使用 Response.json，避免线上 Node/Next 类型版本较旧时构建报静态方法不存在。
+ */
+function createJsonResponse(data: unknown, init?: ResponseInit) {
+  return new Response(JSON.stringify(data), {
+    ...init,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
+}
+
+/**
  * 从请求 body 中提取用户问题。
  * 和 JSON 接口保持同样的长度限制，避免两条链路行为不一致。
  */
@@ -543,7 +556,7 @@ export async function POST(request: Request) {
   const sessionId = body ? getSessionId(body) : null;
 
   if (!message) {
-    return Response.json(
+    return createJsonResponse(
       {
         ok: false,
         error: "message is required",
@@ -602,11 +615,14 @@ export async function POST(request: Request) {
             sessionMemoryContext = historyResult.memoryContext;
             writeEvent("session", { sessionId: activeSessionId });
           }
-          activeSessionIdForLog = activeSessionId;
+          // activeSessionId 经过上面的创建/加载流程后已经确定存在。
+          // 额外声明 const 是为了让后续异步闭包里也保持 string 类型，不被 TypeScript 重新放宽成 string | null。
+          const confirmedSessionId = activeSessionId;
+          activeSessionIdForLog = confirmedSessionId;
 
           await stageTimer.track("write_user_message", () => sql`
               insert into public.chat_messages (session_id, role, content)
-              values (${activeSessionId}, 'user', ${message})
+              values (${confirmedSessionId}, 'user', ${message})
             `);
 
           writeEvent("stage", { stage: "rewrite_question", label: "正在理解问题" });
@@ -662,13 +678,13 @@ export async function POST(request: Request) {
 
           await stageTimer.track("write_assistant_message", () => sql`
               insert into public.chat_messages (session_id, role, content, sources)
-              values (${activeSessionId}, 'assistant', ${answer}, ${sql.json(answerSources)})
+              values (${confirmedSessionId}, 'assistant', ${answer}, ${sql.json(answerSources)})
             `);
 
           await stageTimer.track("memory", async () => {
             try {
-              const historyForMemory = await loadHistoryForMemory(activeSessionId);
-              await refreshSessionSummary(activeSessionId, sessionMemoryContext.summary, historyForMemory);
+              const historyForMemory = await loadHistoryForMemory(confirmedSessionId);
+              await refreshSessionSummary(confirmedSessionId, sessionMemoryContext.summary, historyForMemory);
             } catch {
               // 摘要刷新是辅助记忆能力，失败不能影响本次回答入库和返回。
             }
@@ -677,11 +693,11 @@ export async function POST(request: Request) {
           await stageTimer.track("update_session", () => sql`
               update public.chat_sessions
               set title = ${createTitleFromMessage(message)}, updated_at = now()
-              where id = ${activeSessionId}
+              where id = ${confirmedSessionId}
             `);
 
           await stageTimer.track("write_log", () => writeChatRequestLog({
-            sessionId: activeSessionId,
+            sessionId: confirmedSessionId,
             userMessage: message,
             retrievalQuestion,
             intentProfile,
@@ -695,7 +711,7 @@ export async function POST(request: Request) {
 
           writeEvent("done", {
             answer,
-            sessionId: activeSessionId,
+            sessionId: confirmedSessionId,
             sources: answerSources,
           });
         } catch (error) {
