@@ -276,9 +276,20 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeDesignAssetUrl(url: string | null | undefined) {
+  // 线上图片统一走 /api/design/assets，兼容数据库里历史保存的 /uploads/design-assets 路径。
+  if (!url) {
+    return "";
+  }
+
+  return url.startsWith("/uploads/design-assets/")
+    ? url.replace("/uploads/design-assets/", "/api/design/assets/")
+    : url;
+}
+
 function getRenderableImageUrl(render: DesignRender) {
   // 当前缩略图和原图暂时同源，保留这个方法是为了后续接入真正缩略图时不改 JSX。
-  return render.thumbnail_url || render.image_url;
+  return normalizeDesignAssetUrl(render.thumbnail_url || render.image_url);
 }
 
 function getRenderMode(render: DesignRender): RenderMode {
@@ -332,7 +343,7 @@ function getStructureRenderImageUrl(analysisResult: Record<string, unknown>) {
   const structureRender = getRecordValue(analysisResult.structure_render);
   const imageUrl = structureRender.image_url;
 
-  return typeof imageUrl === "string" && imageUrl ? imageUrl : null;
+  return typeof imageUrl === "string" && imageUrl ? normalizeDesignAssetUrl(imageUrl) : null;
 }
 
 export function DesignWorkspace() {

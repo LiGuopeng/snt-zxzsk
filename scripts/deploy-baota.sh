@@ -113,6 +113,14 @@ echo "=== 8. ensure upload directory writable ==="
 mkdir -p "$DESIGN_ASSET_ROOT"
 chmod -R 755 "$WEB_DIR/public/uploads"
 
+# 兼容历史问题：如果旧 PM2 cwd 导致图片被写到了项目根目录 public/uploads/design-assets，
+# 部署时自动迁移到 apps/web/public/uploads/design-assets，避免数据库已有 image_url 找不到文件。
+LEGACY_DESIGN_ASSET_ROOT="$PROJECT_DIR/public/uploads/design-assets"
+if [ -d "$LEGACY_DESIGN_ASSET_ROOT" ] && [ "$LEGACY_DESIGN_ASSET_ROOT" != "$DESIGN_ASSET_ROOT" ]; then
+  echo "Migrating legacy design assets from $LEGACY_DESIGN_ASSET_ROOT"
+  cp -a "$LEGACY_DESIGN_ASSET_ROOT/." "$DESIGN_ASSET_ROOT/"
+fi
+
 # 固定图片落盘目录，避免 PM2 工作目录不是 apps/web 时把生成图写到 /www/snt-zxzsk/public/uploads。
 export DESIGN_ASSET_ROOT
 
@@ -129,13 +137,13 @@ echo "=== 10. verify local health endpoint ==="
 curl -fsS --max-time 15 "http://127.0.0.1:$APP_PORT/api/health/knowledge"
 echo
 
-echo "=== 11. verify upload static route ==="
-echo "ok" > "$WEB_DIR/public/uploads/.deploy-check.txt"
-if curl -fsS --max-time 15 "http://127.0.0.1:$APP_PORT/uploads/.deploy-check.txt" >/dev/null; then
-  echo "uploads static route ok"
+echo "=== 11. verify design asset route ==="
+echo "ok" > "$DESIGN_ASSET_ROOT/.deploy-check.txt"
+if curl -fsS --max-time 15 "http://127.0.0.1:$APP_PORT/api/design/assets/.deploy-check.txt" >/dev/null; then
+  echo "design asset route ok"
 else
-  echo "uploads static route failed: please check Next/PM2 cwd or Nginx /uploads proxy/alias"
-  echo "expected file: $WEB_DIR/public/uploads/.deploy-check.txt"
+  echo "design asset route failed: please check DESIGN_ASSET_ROOT or PM2 environment"
+  echo "expected file: $DESIGN_ASSET_ROOT/.deploy-check.txt"
   exit 1
 fi
 

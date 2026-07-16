@@ -993,6 +993,17 @@ function getHydropowerTypeConfig(type: HydropowerPointType) {
   return HYDROPOWER_TYPES.find((item) => item.id === type) || HYDROPOWER_TYPES[0];
 }
 
+function normalizeDesignAssetUrl(url: string | null | undefined) {
+  // 户型图和效果图历史数据可能还是 /uploads/design-assets，前端展示时统一切到 API 读取。
+  if (!url) {
+    return "";
+  }
+
+  return url.startsWith("/uploads/design-assets/")
+    ? url.replace("/uploads/design-assets/", "/api/design/assets/")
+    : url;
+}
+
 export function PlanTabNav({
   activeTab,
   hasUploadedFloorPlan,
@@ -1186,7 +1197,11 @@ export function HydropowerPlanPanel({ floorPlan }: { floorPlan: PlanFloorPlan | 
           <div className="relative mx-auto aspect-[1.42] max-h-[560px] min-h-[420px] overflow-hidden rounded-lg border border-[#d9e4f7] bg-white shadow-inner">
             {floorPlan?.file_url ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img alt="户型图底图" className="absolute inset-0 h-full w-full object-contain opacity-70" src={floorPlan.file_url} />
+              <img
+                alt="户型图底图"
+                className="absolute inset-0 h-full w-full object-contain opacity-70"
+                src={normalizeDesignAssetUrl(floorPlan.file_url)}
+              />
             ) : (
               <div className="absolute inset-6 grid grid-cols-4 grid-rows-3 gap-2 opacity-80">
                 {HYDROPOWER_FALLBACK_ROOMS.map((room, index) => (

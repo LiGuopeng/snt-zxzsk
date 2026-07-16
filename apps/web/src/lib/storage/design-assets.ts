@@ -7,7 +7,60 @@ import path from "path";
 const UPLOAD_ROOT = process.env.DESIGN_ASSET_ROOT
   ? path.resolve(process.env.DESIGN_ASSET_ROOT)
   : path.join(process.cwd(), "public", "uploads", "design-assets");
-const PUBLIC_PREFIX = "/uploads/design-assets";
+// 图片统一通过 API 输出，避免线上 Nginx 没有单独配置 /uploads 时前端破图。
+const PUBLIC_PREFIX = "/api/design/assets";
+
+function normalizeStoragePath(storagePath: string) {
+  // storagePath 来自数据库或 URL，必须限制在 design-assets 目录内，防止路径穿越读取服务器其他文件。
+  const normalized = path.posix.normalize(storagePath).replace(/^\/+/, "");
+
+  if (!normalized || normalized === "." || normalized.startsWith("../") || normalized.includes("/../")) {
+    throw new Error("Invalid design asset path");
+  }
+
+  return normalized;
+}
+
+function getDesignAssetAbsolutePath(storagePath: string) {
+  // 最终绝对路径必须仍然位于 UPLOAD_ROOT 内，作为第二层路径安全校验。
+  const normalizedStoragePath = normalizeStoragePath(storagePath);
+  const uploadRoot = path.resolve(UPLOAD_ROOT);
+  const absolutePath = path.resolve(uploadRoot, normalizedStoragePath);
+
+  if (absolutePath !== uploadRoot && !absolutePath.startsWith(`${uploadRoot}${path.sep}`)) {
+    throw new Error("Invalid design asset path");
+  }
+
+  return absolutePath;
+}
+
+export function getDesignAssetContentType(storagePath: string) {
+  // 浏览器需要正确的 Content-Type 才能稳定展示图片。
+  const extension = path.extname(storagePath).toLowerCase();
+
+  if (extension === ".png") {
+    return "image/png";
+  }
+
+  if (extension === ".jpg" || extension === ".jpeg") {
+    return "image/jpeg";
+  }
+
+  if (extension === ".webp") {
+    return "image/webp";
+  }
+
+  if (extension === ".pdf") {
+    return "application/pdf";
+  }
+
+  return "application/octet-stream";
+}
+
+export async function readDesignAsset(storagePath: string) {
+  // 给 /api/design/assets/[...path] 使用：从固定落盘目录读取图片 buffer。
+  return readFile(getDesignAssetAbsolutePath(storagePath));
+}
 
 export function sanitizeFileName(fileName: string) {
   // 保留中文、英文、数字和常见扩展名字符，防止用户上传文件名里带路径或特殊符号。
@@ -32,7 +85,7 @@ export async function saveDesignAsset(params: {
   // prefix 用来区分户型原图和生成结果，projectId 用来隔离不同用户/项目的文件目录。
   const fileName = `${randomUUID()}${params.extension || ".bin"}`;
   const storagePath = `${params.prefix}/${params.projectId}/${fileName}`;
-  const absolutePath = path.join(UPLOAD_ROOT, storagePath);
+  const absolutePath = getDesignAssetAbsolutePath(storagePath);
 
   await mkdir(path.dirname(absolutePath), { recursive: true });
   await writeFile(absolutePath, params.buffer);
@@ -48,7 +101,7 @@ export async function readDesignAssetAsDataUrl(params: {
   storagePath: string;
 }) {
   // 第三方视觉模型无法访问本机相对 URL，解析时要把本地图片读成 data URL 直接传给模型。
-  const buffer = await readFile(path.join(UPLOAD_ROOT, params.storagePath));
+  const buffer = await readDesignAsset(params.storagePath);
   const mimeType = params.contentType || "application/octet-stream";
 
   return `data:${mimeType};base64,${buffer.toString("base64")}`;
@@ -60,5 +113,5 @@ export async function removeDesignAsset(storagePath: string | null | undefined) 
   }
 
   // 这里只接收数据库里的相对 storagePath，不允许外部传绝对路径，避免误删项目目录外的文件。
-  await rm(path.join(UPLOAD_ROOT, storagePath), { force: true });
+  await rm(getDesignAssetAbsolutePath(storagePath), { force: true });
 }
